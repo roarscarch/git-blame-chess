@@ -38,55 +38,34 @@ def export_pgn(game: Game, output_path: Optional[Path] = None) -> str:
     for i, cm in enumerate(game.moves):
         # Determine the side to move based on the board state before the move
         # In standard chess, white moves first, then black, etc.
-        # But here we treat each commit as a move regardless of side.
-        # We'll annotate with the commit info.
-        move_uci = cm.move.uci()
-        san = cm.board_before.san(cm.move)
-
-        # Add comment with commit details
-        comment = f"Commit: {cm.commit_hash[:7]} | {cm.author} | {cm.message}"
-        comment += f"\nFiles changed: {len(cm.files_changed)}, Lines: +{cm.lines_added}/-{cm.lines_deleted}"
-
-        # Create the move in the PGN tree
-        # We need to apply the move to a board to get SAN
-        # But we already have the SAN from the game object
-        # Use the SAN directly
+        # Since we start with an empty board and each commit adds/removes pieces,
+        # we assign moves alternately starting with white for the first commit.
+        turn = chess.WHITE if i % 2 == 0 else chess.BLACK
+        # The actual move UCI is stored in cm.uci
+        # We need to parse it as a chess.Move and add to the PGN
         try:
-            # Parse the SAN move on the current board
-            move_obj = node.board().parse_san(san)
-            node = node.add_variation(move_obj, comment=comment)
-        except (ValueError, chess.InvalidMoveError):
-            # Fallback: use UCI if SAN fails
-            try:
-                move_obj = chess.Move.from_uci(move_uci)
-                if move_obj in node.board().legal_moves:
-                    node = node.add_variation(move_obj, comment=comment)
+            move = chess.Move.from_uci(cm.uci)
+            # Verify the move is legal on the current board state
+            # We simulate the board state up to this point
+            board = chess.Board()
+            for j in range(i):
+                prev_move = chess.Move.from_uci(game.moves[j].uci)
+                if prev_move in board.legal_moves:
+                    board.push(prev_move)
                 else:
-                    # Skip illegal moves in PGN context
-                    continue
-            except (ValueError, chess.InvalidMoveError):
-                continue
-
-    # Set result based on game outcome if available
-    if game.moves:
-        final_board = game.moves[-1].board_after
-        if final_board.is_checkmate():
-            # Determine winner based on who made the last move
-            # In our model, commits alternate? Not necessarily.
-            # We'll just mark as checkmate.
-            pgn_game.headers["Result"] = "1-0" if len(game.moves) % 2 == 1 else "0-1"
-        elif final_board.is_stalemate():
-            pgn_game.headers["Result"] = "1/2-1/2"
-        elif final_board.is_insufficient_material():
-            pgn_game.headers["Result"] = "1/2-1/2"
-        else:
-            pgn_game.headers["Result"] = "*"
-
-    exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
-    pgn_str = pgn_game.accept(exporter)
+                    # If the move is illegal, we ignore it (shouldn't happen in practice)
+                    pass
+            if move in board.legal_moves:
+                node = node.add_variation(move)
+            else:
+                # Fallback: just add the move anyway (might produce unusual games)
+                node = node.add_variation(move)
+        except ValueError:
+            # If the UCI is invalid, skip this move
+            continue
 
     if output_path:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(pgn_str, encoding="utf-8")
+        with open(output_path, "w") as f:
+            f.write(str(pgn_game))
 
-    return pgn_str
+    return str(pgn_game)
