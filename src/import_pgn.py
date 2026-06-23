@@ -1,47 +1,62 @@
-"""Import a PGN file into a Game object for replay or analysis."""
-
 from __future__ import annotations
 
-import io
+import re
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List, Tuple
 
 import chess
 import chess.pgn
 
 from .game import Game, CommitMove
-from .models import get_piece_for_path, path_to_square
+from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE, get_piece_for_path, path_to_square
 
 
-def import_pgn(source: str | Path) -> Game:
+def parse_pgn_file(filepath: Path) -> Optional[Game]:
     """
-    Parse a PGN string or file and return a Game object.
+    Parse a PGN file and reconstruct a Game object.
 
     Args:
-        source: PGN string or path to a PGN file.
+        filepath: Path to the PGN file.
 
     Returns:
-        A Game object with moves reconstructed from the PGN.
-
-    Raises:
-        ValueError: If the PGN is invalid or cannot be parsed.
+        A Game object if parsing succeeds, None otherwise.
     """
-    if isinstance(source, Path):
-        with open(source, "r") as f:
-            pgn_str = f.read()
-    else:
-        pgn_str = source
+    try:
+        with open(filepath, "r") as f:
+            pgn_text = f.read()
+        return parse_pgn_string(pgn_text)
+    except (IOError, OSError) as e:
+        print(f"Error reading PGN file: {e}")
+        return None
 
-    pgn_game = chess.pgn.read_game(io.StringIO(pgn_str))
+
+def parse_pgn_string(pgn_text: str) -> Optional[Game]:
+    """
+    Parse a PGN string and reconstruct a Game object.
+
+    Args:
+        pgn_text: The PGN game data as a string.
+
+    Returns:
+        A Game object if parsing succeeds, None otherwise.
+    """
+    try:
+        pgn_game = chess.pgn.read_game(pgn_text)
+    except ValueError as e:
+        print(f"Error parsing PGN: {e}")
+        return None
+
     if pgn_game is None:
-        raise ValueError("Invalid PGN: could not parse.")
+        return None
 
-    # Extract metadata from headers
-    repo_path = Path(pgn_game.headers.get("Site", "."))
-    branch = pgn_game.headers.get("Event", "imported").replace("Git Blame Chess - ", "")
+    # Extract headers
+    headers = pgn_game.headers
+    repo_path = headers.get("Site", "")
+    branch = headers.get("Event", "").replace("Git Blame Chess - ", "")
+    author = headers.get("White", "Unknown")
 
-    # Reconstruct moves
-    moves: list[CommitMove] = []
+    # Reconstruct moves from the PGN
+    moves: List[CommitMove] = []
     node = pgn_game
     move_number = 0
     while node.variations:
@@ -49,59 +64,38 @@ def import_pgn(source: str | Path) -> Game:
         move = node.move
         if move is None:
             continue
-        # Build a CommitMove from the chess.Move
-        # We use deterministic dummy values for fields that are not available
-        # The piece type is derived from the move's piece (if available via board context)
-        # but we can approximate by the move's promotion or capture flag
-        from_square = chess.square_name(move.from_square)
-        to_square = chess.square_name(move.to_square)
-        piece = chess.PAWN  # default, will be adjusted if possible
-        # Try to get the board state before this move to determine piece type
-        # Since we don't have the board, we infer from the move itself
+        # Reconstruct the CommitMove from the chess.Move
+        # We need to map the UCI move back to a file/line change
+        # Since the original mapping is lost, we create a synthetic CommitMove
+        # that stores the UCI string for replay purposes
+        uci_str = move.uci()
+        # Determine piece type from the move (promotion piece if any)
+        piece_type = None
         if move.promotion:
-            piece = move.promotion
-        elif move.drop:
-            piece = move.drop
-        # Fallback: parse from SAN (slow but works for simple cases)
-        # We'll set a placeholder author
-        author = node.comment if node.comment else "unknown"
+            piece_type = chess.PIECE_SYMBOLS[move.promotion]
+        # Create a dummy file path based on the move
+        # Format: pgn_move_{move_number}_{uci_str}
+        file_path = f"pgn_move_{move_number}_{uci_str}.txt"
+        # Determine the piece based on the move's piece type (if available)
+        # Fall back to DEFAULT_PIECE
+        piece = EXTENSION_PIECE_MAP.get(".txt", DEFAULT_PIECE)
+        if piece_type:
+            # Map chess piece symbols to our piece types
+            symbol_to_piece = {
+                "p": "pawn",
+                "n": "knight",
+                "b": "bishop",
+                "r": "rook",
+                "q": "queen",
+                "k": "king",
+            }
+            piece = symbol_to_piece.get(piece_type, piece)
+        # Compute a square from the destination square of the move
+        dest_square = move.to_square
+        # Convert square index to board coordinate string (e.g., "e4")
+        square_name = chess.SQUARE_NAMES[dest_square]
+        # Create the CommitMove
         cm = CommitMove(
-            commit_hash=f"imported-{move_number}",
+            commit_hash=f"pgn-import-{move_number}",
             author=author,
-            message=node.comment or "",
-            from_square=from_square,
-            to_square=to_square,
-            piece=piece,
-            capture=node.board().is_capture(move) if node.board() else False,
-            check=node.board().is_check() if node.board() else False,
-            timestamp="",
-            diff_stats={},
-        )
-        moves.append(cm)
-        move_number += 1
-
-    # Create a dummy Game object (no actual repo needed)
-    game = Game.__new__(Game)
-    game.repo_path = repo_path
-    game.branch = branch
-    game.moves = moves
-    game.current_index = 0
-    game.board = chess.Board()
-    # Replay moves onto the board
-    for cm in moves:
-        move = chess.Move.from_uci(cm.from_square + cm.to_square)
-        if move in game.board.legal_moves:
-            game.board.push(move)
-        else:
-            # Try to find the correct move by SAN
-            san_move = None
-            for legal in game.board.legal_moves:
-                if game.board.san(legal) == cm.message.split()[0] if cm.message else None:
-                    san_move = legal
-                    break
-            if san_move:
-                game.board.push(san_move)
-            else:
-                # Push anyway (may raise)
-                game.board.push(move)
-    return game
+            message=f"PGN move {move_number + 1}: {uci_str}
