@@ -1,101 +1,150 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
-from typing import Optional, List, Tuple
-
 import chess
 import chess.pgn
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-from .game import Game, CommitMove
-from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE, get_piece_for_path, path_to_square
+from .models import path_to_square, get_piece_for_path
 
 
-def parse_pgn_file(filepath: Path) -> Optional[Game]:
+def import_pgn_file(pgn_path: Path) -> chess.Board:
     """
-    Parse a PGN file and reconstruct a Game object.
-
+    Import a PGN file and return the final board state.
+    
     Args:
-        filepath: Path to the PGN file.
-
+        pgn_path: Path to the PGN file.
+        
     Returns:
-        A Game object if parsing succeeds, None otherwise.
+        The chess.Board after all moves are applied.
+        
+    Raises:
+        FileNotFoundError: If the PGN file does not exist.
+        ValueError: If the PGN file is malformed or contains invalid moves.
     """
-    try:
-        with open(filepath, "r") as f:
-            pgn_text = f.read()
-        return parse_pgn_string(pgn_text)
-    except (IOError, OSError) as e:
-        print(f"Error reading PGN file: {e}")
-        return None
+    if not pgn_path.exists():
+        raise FileNotFoundError(f"PGN file not found: {pgn_path}")
+    
+    with open(pgn_path, 'r') as f:
+        game = chess.pgn.read_game(f)
+    
+    if game is None:
+        raise ValueError("Could not parse PGN file: file is empty or malformed")
+    
+    board = game.board()
+    for move in game.mainline_moves():
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move in PGN: {move.uci()}")
+        board.push(move)
+    
+    return board
 
 
-def parse_pgn_string(pgn_text: str) -> Optional[Game]:
+def import_pgn_with_headers(pgn_path: Path) -> Tuple[chess.Board, dict]:
     """
-    Parse a PGN string and reconstruct a Game object.
-
+    Import a PGN file and return both the final board state and headers.
+    
     Args:
-        pgn_text: The PGN game data as a string.
-
+        pgn_path: Path to the PGN file.
+        
     Returns:
-        A Game object if parsing succeeds, None otherwise.
+        A tuple of (board, headers_dict).
+        
+    Raises:
+        FileNotFoundError: If the PGN file does not exist.
+        ValueError: If the PGN file is malformed.
     """
-    try:
-        pgn_game = chess.pgn.read_game(pgn_text)
-    except ValueError as e:
-        print(f"Error parsing PGN: {e}")
-        return None
+    if not pgn_path.exists():
+        raise FileNotFoundError(f"PGN file not found: {pgn_path}")
+    
+    with open(pgn_path, 'r') as f:
+        game = chess.pgn.read_game(f)
+    
+    if game is None:
+        raise ValueError("Could not parse PGN file: file is empty or malformed")
+    
+    headers = game.headers
+    board = game.board()
+    for move in game.mainline_moves():
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move in PGN: {move.uci()}")
+        board.push(move)
+    
+    return board, dict(headers)
 
-    if pgn_game is None:
-        return None
 
-    # Extract headers
-    headers = pgn_game.headers
-    repo_path = headers.get("Site", "")
-    branch = headers.get("Event", "").replace("Git Blame Chess - ", "")
-    author = headers.get("White", "Unknown")
+def import_pgn_moves(pgn_path: Path) -> List[chess.Move]:
+    """
+    Import a PGN file and return the list of moves.
+    
+    Args:
+        pgn_path: Path to the PGN file.
+        
+    Returns:
+        A list of chess.Move objects in order.
+        
+    Raises:
+        FileNotFoundError: If the PGN file does not exist.
+        ValueError: If the PGN file is malformed or contains invalid moves.
+    """
+    if not pgn_path.exists():
+        raise FileNotFoundError(f"PGN file not found: {pgn_path}")
+    
+    with open(pgn_path, 'r') as f:
+        game = chess.pgn.read_game(f)
+    
+    if game is None:
+        raise ValueError("Could not parse PGN file: file is empty or malformed")
+    
+    moves = []
+    board = chess.Board()
+    for move in game.mainline_moves():
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move in PGN: {move.uci()}")
+        moves.append(move)
+        board.push(move)
+    
+    return moves
 
-    # Reconstruct moves from the PGN
-    moves: List[CommitMove] = []
-    node = pgn_game
-    move_number = 0
-    while node.variations:
-        node = node.variations[0]
-        move = node.move
-        if move is None:
-            continue
-        # Reconstruct the CommitMove from the chess.Move
-        # We need to map the UCI move back to a file/line change
-        # Since the original mapping is lost, we create a synthetic CommitMove
-        # that stores the UCI string for replay purposes
-        uci_str = move.uci()
-        # Determine piece type from the move (promotion piece if any)
-        piece_type = None
-        if move.promotion:
-            piece_type = chess.PIECE_SYMBOLS[move.promotion]
-        # Create a dummy file path based on the move
-        # Format: pgn_move_{move_number}_{uci_str}
-        file_path = f"pgn_move_{move_number}_{uci_str}.txt"
-        # Determine the piece based on the move's piece type (if available)
-        # Fall back to DEFAULT_PIECE
-        piece = EXTENSION_PIECE_MAP.get(".txt", DEFAULT_PIECE)
-        if piece_type:
-            # Map chess piece symbols to our piece types
-            symbol_to_piece = {
-                "p": "pawn",
-                "n": "knight",
-                "b": "bishop",
-                "r": "rook",
-                "q": "queen",
-                "k": "king",
-            }
-            piece = symbol_to_piece.get(piece_type, piece)
-        # Compute a square from the destination square of the move
-        dest_square = move.to_square
-        # Convert square index to board coordinate string (e.g., "e4")
-        square_name = chess.SQUARE_NAMES[dest_square]
-        # Create the CommitMove
+
+def pgn_to_game(pgn_path: Path, repo_path: Optional[Path] = None) -> 'Game':
+    """
+    Convert a PGN file into a Game object for interactive replay.
+    
+    Args:
+        pgn_path: Path to the PGN file.
+        repo_path: Optional path to the git repository (for metadata).
+        
+    Returns:
+        A Game object initialized with the moves from the PGN.
+        
+    Raises:
+        FileNotFoundError: If the PGN file does not exist.
+        ValueError: If the PGN file is malformed or contains invalid moves.
+    """
+    from .game import Game
+    from .models import CommitMove
+    
+    board, headers = import_pgn_with_headers(pgn_path)
+    
+    # Reconstruct moves list
+    game = chess.pgn.read_game(open(pgn_path, 'r'))
+    moves = list(game.mainline_moves())
+    
+    commit_moves = []
+    for i, move in enumerate(moves):
         cm = CommitMove(
-            commit_hash=f"pgn-import-{move_number}",
-            author=author,
-            message=f"PGN move {move_number + 1}: {uci_str}
+            commit_hash=headers.get("Site", f"pgn-move-{i}"),
+            author=headers.get("White", "?") if i % 2 == 0 else headers.get("Black", "?"),
+            message=headers.get("Event", "Imported from PGN"),
+            move=move,
+            timestamp=headers.get("Date", "?"),
+        )
+        commit_moves.append(cm)
+    
+    return Game(
+        repo_path=repo_path or Path("."),
+        branch="imported",
+        moves=commit_moves,
+        board=board,
+    )
