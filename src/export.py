@@ -1,100 +1,63 @@
 from __future__ import annotations
 
-import hashlib
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
 import chess
 import chess.pgn
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
 
 from .game import Game, CommitMove
-from .duel import BranchDuel, DuelState
+from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE
 
 
-def export_game_to_pgn(game: Game, output_path: Optional[Path] = None) -> str:
-    """Export a single-branch game to PGN format."""
-    game_node = chess.pgn.Game()
-    game_node.headers["Event"] = "Git Blame Chess - Single Branch"
-    game_node.headers["Site"] = str(game.repo_path)
-    game_node.headers["Date"] = "????.??.??"
-    game_node.headers["Round"] = "1"
-    game_node.headers["White"] = game.branch or "main"
-    game_node.headers["Black"] = "History"
-    game_node.headers["Result"] = "*"
-
-    current_node = game_node
-    for move in game.moves:
-        if move.uci is None:
-            continue
-        try:
-            chess_move = chess.Move.from_uci(move.uci)
-            if chess_move in game.board.legal_moves:
-                game.board.push(chess_move)
-                current_node = current_node.add_variation(chess_move)
-                current_node.comment = f"Commit: {move.commit_hash[:8]} - {move.message.split(chr(10))[0]}"
-        except (ValueError, chess.InvalidMoveError):
-            continue
-
-    exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
-    pgn_str = game_node.accept(exporter)
-
-    if output_path:
-        output_path.write_text(pgn_str)
-    return pgn_str
-
-
-def export_duel_to_pgn(duel: BranchDuel, output_path: Optional[Path] = None) -> str:
-    """Export a branch duel to PGN format, tracking board state.
-
-    The duel alternates between left and right branches. Each move is annotated
-    with its branch and commit hash. Merge commits reset to common ancestor.
+def export_game_to_pgn(
+    game: Game,
+    output_path: Path,
+    repo_name: str = "",
+    branch: str = "",
+    author: str = "",
+    date: Optional[datetime] = None,
+    annotations: Optional[List[str]] = None,
+) -> Path:
     """
-    if duel.state is None:
-        duel.initialize()
+    Export a Game object to a PGN file with metadata and move annotations.
 
-    state = duel.state
-    game_node = chess.pgn.Game()
-    game_node.headers["Event"] = "Git Blame Chess - Branch Duel"
-    game_node.headers["Site"] = str(duel.repo.working_dir)
-    game_node.headers["Date"] = "????.??.??"
-    game_node.headers["Round"] = "1"
-    game_node.headers["White"] = duel.left_branch
-    game_node.headers["Black"] = duel.right_branch
-    game_node.headers["Result"] = "*"
+    Args:
+        game: The Game instance to export.
+        output_path: Path where the PGN file will be written.
+        repo_name: Name of the repository (for event tag).
+        branch: Branch name (for site tag).
+        author: Author of the game (for player names).
+        date: Date of the game (default: current date).
+        annotations: Optional list of comment strings per move (in order).
 
-    current_node = game_node
-    board = chess.Board()
+    Returns:
+        The Path to the written PGN file.
+    """
+    if date is None:
+        date = datetime.now()
 
-    # Simulate the duel turn by turn
-    left_idx = 0
-    right_idx = 0
-    turn = 0  # 0 = left, 1 = right
+    # Create a new PGN game node
+    pgn_game = chess.pgn.Game()
+    pgn_game.headers["Event"] = f"Git Blame Chess: {repo_name}" if repo_name else "Git Blame Chess"
+    pgn_game.headers["Site"] = branch if branch else "local"
+    pgn_game.headers["Date"] = date.strftime("%Y.%m.%d")
+    pgn_game.headers["Round"] = "1"
+    pgn_game.headers["White"] = author if author else "White"
+    pgn_game.headers["Black"] = "Black"
+    pgn_game.headers["Result"] = "*"  # Unknown result
 
-    left_moves = state.left_game.moves
-    right_moves = state.right_game.moves
-
-    while left_idx < len(left_moves) or right_idx < len(right_moves):
-        if turn == 0:
-            if left_idx >= len(left_moves):
-                break
-            move = left_moves[left_idx]
-            left_idx += 1
-            player = duel.left_branch
-        else:
-            if right_idx >= len(right_moves):
-                break
-            move = right_moves[right_idx]
-            right_idx += 1
-            player = duel.right_branch
-
-        if move.uci is None:
-            turn = 1 - turn
-            continue
-
-        try:
-            chess_move = chess.Move.from_uci(move.uci)
-            if chess_move in board.legal_moves:
-                board.push(chess_move)
-                current_node = current_node.add_variation(chess_move)
-                current_node.comment = (
-                    f"{player} | Commit: {move.commit_hash[:8]} - {move.message.split(chr(10))[0]}
+    # Build the move list with optional annotations
+    node = pgn_game
+    for i, move in enumerate(game.history):
+        # Convert CommitMove to a chess.Move
+        chess_move = chess.Move(move.from_square, move.to_square, move.promotion)
+        if not game.board.is_legal(chess_move):
+            continue  # Skip illegal moves (should not happen in valid games)
+        game.board.push(chess_move)
+        node = node.add_variation(chess_move)
+        # Add annotation if provided
+        if annotations and i < len(annotations):
+            node.comment = annotations[i]
+        # Add commit hash as a comment
+        node.comment = f"commit: {move.commit_hash[:7]}
