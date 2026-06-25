@@ -38,68 +38,91 @@ def render_board(
     board: chess.Board,
     last_move: chess.Move | None = None,
     legal_moves: set[chess.Square] | None = None,
-    highlighted_squares: set[chess.Square] | None = None,
+    highlight_squares: set[chess.Square] | None = None,
 ) -> str:
-    """Render a chess board with colored squares and Unicode pieces.
+    """Render the board as a colored string for terminal output.
 
     Args:
         board: The chess board to render.
-        last_move: The last move played, to highlight from/to squares.
-        legal_moves: Set of squares that are legal moves for the current player.
-        highlighted_squares: Additional squares to highlight.
+        last_move: The last move played (to highlight from/to squares).
+        legal_moves: Set of squares that are legal move destinations.
+        highlight_squares: Additional squares to highlight (e.g., selected piece).
 
     Returns:
-        A string representation of the board with ANSI color codes.
+        A string with ANSI escape codes for colored terminal output.
     """
-    lines = []
+    if legal_moves is None:
+        legal_moves = set()
+    if highlight_squares is None:
+        highlight_squares = set()
+
+    lines: list[str] = []
     # Column labels
-    header = '  ' + ' '.join(chr(ord('a') + col) for col in range(8))
-    lines.append(f'{COLOR_COORD_LABEL}{header}{COLOR_RESET}')
+    col_labels = '  a  b  c  d  e  f  g  h'
+    lines.append(col_labels)
+    lines.append('  ' + '-' * 33)
 
     for rank in range(7, -1, -1):
-        row = f'{COLOR_COORD_LABEL}{rank + 1}{COLOR_RESET} '
+        row = f'{rank + 1} |'
         for file in range(8):
-            square = rank * 8 + file
+            square = chess.square(file, rank)
             piece = board.piece_at(square)
             is_light = square_color(square)
-
-            # Determine background color
             bg = COLOR_WHITE_SQUARE if is_light else COLOR_BLACK_SQUARE
-            if last_move and (square == last_move.from_square or square == last_move.to_square):
-                bg = COLOR_LAST_MOVE
-            elif legal_moves and square in legal_moves:
+
+            # Determine if this square should be highlighted
+            if last_move:
+                if square == last_move.from_square or square == last_move.to_square:
+                    bg = COLOR_LAST_MOVE
+            if square in legal_moves:
                 bg = COLOR_LEGAL_MOVE
-            elif highlighted_squares and square in highlighted_squares:
+            if square in highlight_squares:
                 bg = COLOR_HIGHLIGHT
 
             if piece:
                 symbol = get_piece_symbol(piece)
-                fg = COLOR_WHITE_PIECE if piece.color == chess.WHITE else COLOR_BLACK_PIECE
-                cell = f'{bg}{fg} {symbol} {COLOR_RESET}'
+                fg = COLOR_WHITE_PIECE if piece.color else COLOR_BLACK_PIECE
+                row += f'{bg}{fg} {symbol} {COLOR_RESET}'
             else:
-                cell = f'{bg}   {COLOR_RESET}'
-            row += cell
-        row += f'{COLOR_COORD_LABEL}{rank + 1}{COLOR_RESET}'
+                if is_light:
+                    row += f'{bg}   {COLOR_RESET}'
+                else:
+                    row += f'{bg}   {COLOR_RESET}'
+        row += f'| {rank + 1}'
         lines.append(row)
 
-    lines.append(f'{COLOR_COORD_LABEL}{header}{COLOR_RESET}')
-    return '\
-'.join(lines)
+    lines.append('  ' + '-' * 33)
+    lines.append(col_labels)
+    return '\n'.join(lines)
 
 
-def render_move(move: chess.Move) -> str:
-    """Render a chess move in algebraic notation."""
-    return board.san(move) if 'board' in locals() else str(move)
+def render_move(move: chess.Move, board: chess.Board) -> str:
+    """Render a move in algebraic notation with piece symbols.
+
+    Args:
+        move: The move to render.
+        board: The board state before the move (for disambiguation).
+
+    Returns:
+        A string like '♘c3' or '♙e4'.
+    """
+    piece = board.piece_at(move.from_square)
+    if piece:
+        symbol = get_piece_symbol(piece)
+        # Use UCI-like notation for simplicity
+        uci = move.uci()
+        return f'{symbol}{uci}'
+    return move.uci()
 
 
-def render_board_plain(board: chess.Board) -> str:
-    """Render a chess board without colors (for logging or non-ANSI output)."""
-    lines = []
-    for rank in range(7, -1, -1):
-        row = f'{rank + 1} '
-        for file in range(8):
-            square = rank * 8 + file
-            piece = board.piece_at(square)
-            if piece:
-                symbol = PIECE_SYMBOLS[piece.piece_type][piece.color]
-                row += f'{symbol}
+def render_game_info(game_info: dict) -> str:
+    """Render game metadata like players, date, result, etc."""
+    lines: list[str] = []
+    for key, value in game_info.items():
+        lines.append(f'{key}: {value}')
+    return '\n'.join(lines)
+
+
+def render_promotion_choices() -> str:
+    """Render a prompt for promotion piece selection."""
+    return 'Promote to: [Q]ueen, [R]ook, [B]ishop, [K]night: '
