@@ -38,149 +38,68 @@ def render_board(
     board: chess.Board,
     last_move: chess.Move | None = None,
     legal_moves: set[chess.Square] | None = None,
-    selected_square: chess.Square | None = None,
-    flipped: bool = False,
+    highlighted_squares: set[chess.Square] | None = None,
 ) -> str:
-    """
-    Render the chess board as a colored string for terminal output.
+    """Render a chess board with colored squares and Unicode pieces.
 
     Args:
         board: The chess board to render.
-        last_move: The last move made, to highlight from/to squares.
-        legal_moves: Set of squares that are legal moves from the selected square.
-        selected_square: The currently selected square (for highlighting).
-        flipped: If True, flip the board so black is at the bottom.
+        last_move: The last move played, to highlight from/to squares.
+        legal_moves: Set of squares that are legal moves for the current player.
+        highlighted_squares: Additional squares to highlight.
 
     Returns:
-        A string with ANSI color codes for terminal display.
+        A string representation of the board with ANSI color codes.
     """
-    lines: list[str] = []
-    ranks = range(7, -1, -1) if not flipped else range(0, 8)
-    files = range(0, 8) if not flipped else range(7, -1, -1)
+    lines = []
+    # Column labels
+    header = '  ' + ' '.join(chr(ord('a') + col) for col in range(8))
+    lines.append(f'{COLOR_COORD_LABEL}{header}{COLOR_RESET}')
 
-    # Top coordinate label
-    coord_line = '  '
-    for f in files:
-        coord_line += f'{COLOR_COORD_LABEL} {chess.FILE_NAMES[f]} {COLOR_RESET}'
-    lines.append(coord_line)
-
-    for r in ranks:
-        row: list[str] = []
-        # Rank label on the left
-        row.append(f'{COLOR_COORD_LABEL}{chess.RANK_NAMES[r]}{COLOR_RESET} ')
-        for f in files:
-            square = chess.square(f, r)
+    for rank in range(7, -1, -1):
+        row = f'{COLOR_COORD_LABEL}{rank + 1}{COLOR_RESET} '
+        for file in range(8):
+            square = rank * 8 + file
             piece = board.piece_at(square)
-            is_light_square = square_color(square)
+            is_light = square_color(square)
 
             # Determine background color
-            if selected_square is not None and square == selected_square:
-                bg = COLOR_HIGHLIGHT
-            elif last_move is not None and square in (last_move.from_square, last_move.to_square):
+            bg = COLOR_WHITE_SQUARE if is_light else COLOR_BLACK_SQUARE
+            if last_move and (square == last_move.from_square or square == last_move.to_square):
                 bg = COLOR_LAST_MOVE
-            elif legal_moves is not None and square in legal_moves:
+            elif legal_moves and square in legal_moves:
                 bg = COLOR_LEGAL_MOVE
-            else:
-                bg = COLOR_WHITE_SQUARE if is_light_square else COLOR_BLACK_SQUARE
+            elif highlighted_squares and square in highlighted_squares:
+                bg = COLOR_HIGHLIGHT
 
-            if piece is None:
-                # Empty square
-                row.append(f'{bg}   {COLOR_RESET}')
-            else:
+            if piece:
                 symbol = get_piece_symbol(piece)
                 fg = COLOR_WHITE_PIECE if piece.color == chess.WHITE else COLOR_BLACK_PIECE
-                row.append(f'{bg}{fg} {symbol} {COLOR_RESET}')
-        lines.append(''.join(row))
-        # Rank label on the right
-        lines[-1] += f' {COLOR_COORD_LABEL}{chess.RANK_NAMES[r]}{COLOR_RESET}'
+                cell = f'{bg}{fg} {symbol} {COLOR_RESET}'
+            else:
+                cell = f'{bg}   {COLOR_RESET}'
+            row += cell
+        row += f'{COLOR_COORD_LABEL}{rank + 1}{COLOR_RESET}'
+        lines.append(row)
 
-    # Bottom coordinate label
-    coord_line = '  '
-    for f in files:
-        coord_line += f'{COLOR_COORD_LABEL} {chess.FILE_NAMES[f]} {COLOR_RESET}'
-    lines.append(coord_line)
-
-    return '\n'.join(lines)
+    lines.append(f'{COLOR_COORD_LABEL}{header}{COLOR_RESET}')
+    return '\
+'.join(lines)
 
 
-def render_move_history(moves: list[chess.Move], board: chess.Board | None = None) -> str:
-    """
-    Render a list of moves in algebraic notation.
-
-    Args:
-        moves: List of chess moves.
-        board: Optional board to use for disambiguation (if None, creates a new board).
-
-    Returns:
-        A string with move numbers and algebraic notation.
-    """
-    if board is None:
-        board = chess.Board()
-    lines: list[str] = []
-    for i, move in enumerate(moves):
-        san = board.san(move)
-        board.push(move)
-        if i % 2 == 0:
-            move_number = i // 2 + 1
-            lines.append(f'{move_number}. {san}')
-        else:
-            lines[-1] += f' {san}'
-    return ' '.join(lines)
+def render_move(move: chess.Move) -> str:
+    """Render a chess move in algebraic notation."""
+    return board.san(move) if 'board' in locals() else str(move)
 
 
-def render_game_status(board: chess.Board) -> str:
-    """
-    Render the game status (checkmate, stalemate, etc.) as a string.
-
-    Args:
-        board: The chess board to evaluate.
-
-    Returns:
-        A string describing the game status.
-    """
-    if board.is_checkmate():
-        winner = 'White' if board.turn == chess.BLACK else 'Black'
-        return f'Checkmate! {winner} wins.'
-    elif board.is_stalemate():
-        return 'Stalemate! The game is a draw.'
-    elif board.is_insufficient_material():
-        return 'Draw due to insufficient material.'
-    elif board.is_check():
-        return 'Check!'
-    else:
-        turn = 'White' if board.turn == chess.WHITE else 'Black'
-        return f'{turn} to move.'
-
-
-def render_full_display(
-    board: chess.Board,
-    moves: list[chess.Move],
-    last_move: chess.Move | None = None,
-    legal_moves: set[chess.Square] | None = None,
-    selected_square: chess.Square | None = None,
-    flipped: bool = False,
-) -> str:
-    """
-    Render the full display including board, move history, and game status.
-
-    Args:
-        board: The chess board to render.
-        moves: List of moves played so far.
-        last_move: The last move made.
-        legal_moves: Set of legal move target squares.
-        selected_square: The currently selected square.
-        flipped: If True, flip the board.
-
-    Returns:
-        A string with the complete display.
-    """
-    lines: list[str] = []
-    lines.append('=== Git Blame Chess ===')
-    lines.append('')
-    lines.append(render_board(board, last_move, legal_moves, selected_square, flipped))
-    lines.append('')
-    lines.append('Move History:')
-    lines.append(render_move_history(moves))
-    lines.append('')
-    lines.append(render_game_status(board))
-    return '\n'.join(lines)
+def render_board_plain(board: chess.Board) -> str:
+    """Render a chess board without colors (for logging or non-ANSI output)."""
+    lines = []
+    for rank in range(7, -1, -1):
+        row = f'{rank + 1} '
+        for file in range(8):
+            square = rank * 8 + file
+            piece = board.piece_at(square)
+            if piece:
+                symbol = PIECE_SYMBOLS[piece.piece_type][piece.color]
+                row += f'{symbol}
