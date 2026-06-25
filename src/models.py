@@ -1,6 +1,3 @@
-# src/models.py
-"""Data models and mapping logic for git-blame-chess."""
-
 from __future__ import annotations
 
 import hashlib
@@ -9,88 +6,79 @@ from typing import Dict, Optional
 
 import chess
 
-# Mapping from file extension to chess piece type.
-EXTENSION_PIECE_MAP: Dict[str, chess.PieceType] = {
-    ".py": chess.PAWN,
-    ".js": chess.KNIGHT,
-    ".ts": chess.KNIGHT,
-    ".rs": chess.ROOK,
-    ".go": chess.BISHOP,
-    ".java": chess.QUEEN,
-    ".c": chess.ROOK,
-    ".cpp": chess.ROOK,
-    ".h": chess.BISHOP,
-    ".hpp": chess.BISHOP,
-    ".css": chess.KNIGHT,
-    ".html": chess.PAWN,
-    ".json": chess.PAWN,
-    ".yaml": chess.PAWN,
-    ".yml": chess.PAWN,
-    ".toml": chess.PAWN,
-    ".md": chess.PAWN,
-    ".txt": chess.PAWN,
-    ".sql": chess.BISHOP,
-    ".sh": chess.KNIGHT,
-    ".pl": chess.BISHOP,
-    ".rb": chess.KNIGHT,
-    ".php": chess.PAWN,
-    ".swift": chess.KNIGHT,
-    ".kt": chess.KNIGHT,
-    ".scala": chess.KNIGHT,
-    ".ex": chess.BISHOP,
-    ".exs": chess.BISHOP,
-}
-
-# Default piece type for unknown extensions.
+# Default piece type for unknown file extensions
 DEFAULT_PIECE = chess.PAWN
 
+# Map file extensions to chess piece types
+EXTENSION_PIECE_MAP: Dict[str, int] = {
+    '.py': chess.BISHOP,        # Python files: bishops (logic)
+    '.js': chess.KNIGHT,        # JavaScript: knights (agile)
+    '.ts': chess.KNIGHT,        # TypeScript: knights
+    '.java': chess.ROOK,        # Java: rooks (structured)
+    '.cpp': chess.ROOK,         # C++: rooks
+    '.c': chess.ROOK,           # C: rooks
+    '.h': chess.PAWN,           # Headers: pawns
+    '.hpp': chess.PAWN,
+    '.rs': chess.BISHOP,        # Rust: bishops
+    '.go': chess.BISHOP,        # Go: bishops
+    '.rb': chess.BISHOP,        # Ruby: bishops
+    '.swift': chess.KNIGHT,
+    '.kt': chess.KNIGHT,
+    '.scala': chess.BISHOP,
+    '.html': chess.PAWN,        # HTML: pawns (foundation)
+    '.css': chess.PAWN,
+    '.scss': chess.PAWN,
+    '.less': chess.PAWN,
+    '.json': chess.PAWN,
+    '.yaml': chess.PAWN,
+    '.yml': chess.PAWN,
+    '.toml': chess.PAWN,
+    '.xml': chess.PAWN,
+    '.md': chess.PAWN,          # Markdown: pawns
+    '.rst': chess.PAWN,
+    '.txt': chess.PAWN,
+    '.sh': chess.KNIGHT,        # Shell scripts: knights (quick)
+    '.bash': chess.KNIGHT,
+    '.zsh': chess.KNIGHT,
+    '.ps1': chess.KNIGHT,
+    '.sql': chess.ROOK,         # SQL: rooks (data structures)
+    '.proto': chess.ROOK,
+    '.graphql': chess.ROOK,
+    '.vue': chess.KNIGHT,
+    '.svelte': chess.KNIGHT,
+    '.jsx': chess.KNIGHT,
+    '.tsx': chess.KNIGHT,
+    '.dockerfile': chess.PAWN,
+    'Dockerfile': chess.PAWN,
+    '.gitignore': chess.PAWN,
+    '.gitattributes': chess.PAWN,
+    '.env': chess.PAWN,
+    '.editorconfig': chess.PAWN,
+    'Makefile': chess.ROOK,
+    'CMakeLists.txt': chess.ROOK,
+    'Cargo.toml': chess.PAWN,
+    'package.json': chess.PAWN,
+    'requirements.txt': chess.PAWN,
+    'Pipfile': chess.PAWN,
+    'Gemfile': chess.PAWN,
+}
 
-def get_piece_for_path(file_path: str) -> chess.PieceType:
-    """Determine the piece type based on file extension."""
-    path = Path(file_path)
-    suffix = path.suffix.lower()
+
+def get_piece_for_path(file_path: str) -> int:
+    """Determine chess piece type based on file extension."""
+    path_lower = file_path.lower()
+    # Check exact filenames first
+    base = Path(path_lower).name
+    if base in EXTENSION_PIECE_MAP:
+        return EXTENSION_PIECE_MAP[base]
+    # Then check extensions
+    suffix = Path(path_lower).suffix
     return EXTENSION_PIECE_MAP.get(suffix, DEFAULT_PIECE)
 
 
 def path_to_square(file_path: str, line_number: int) -> chess.Square:
     """
-    Deterministically map a file path and line number to a chess square.
-
-    Uses SHA-256 to hash the combination, then maps the hash to a board
-    square (0-63).
+    Map a file path and line number to a chess board square (0-63).
+    Uses a deterministic hash of the path and line number.
     """
-    raw = f"{file_path}:{line_number}"
-    digest = hashlib.sha256(raw.encode()).digest()
-    # Use first 2 bytes mod 64
-    index = (digest[0] << 8 | digest[1]) % 64
-    return chess.Square(index)
-
-
-def piece_from_diff(file_path: str, lines_added: int, lines_deleted: int) -> chess.Piece:
-    """
-    Create a chess piece based on the diff statistics.
-
-    Args:
-        file_path: Path of the changed file.
-        lines_added: Number of lines added.
-        lines_deleted: Number of lines deleted.
-
-    Returns:
-        A chess.Piece with appropriate type and color.
-    """
-    piece_type = get_piece_for_path(file_path)
-    # Determine color: if more lines added than deleted, treat as white; else black.
-    color = chess.WHITE if lines_added >= lines_deleted else chess.BLACK
-    return chess.Piece(piece_type=piece_type, color=color)
-
-
-def square_from_commit_hash(commit_hash: str) -> chess.Square:
-    """
-    Map a commit hash to a starting square for the piece.
-
-    Uses the first 2 bytes of the SHA-1 hash (after converting from hex).
-    """
-    # Take first 4 hex chars (2 bytes) from the hash
-    hex_bytes = commit_hash[:4]
-    index = int(hex_bytes, 16) % 64
-    return chess.Square(index)
+    hash_input = f"{file_path}:{line_number}
