@@ -1,140 +1,101 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import chess
 import chess.pgn
 
-from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE, get_piece_for_path, path_to_square
+from .models import CommitMove, EXTENSION_PIECE_MAP
 
 
-@dataclass
-class PGNImportResult:
-    """Result of importing a PGN file."""
-    moves: List[chess.Move]
-    headers: Dict[str, str]
-    board: chess.Board = field(default_factory=chess.Board)
-    errors: List[str] = field(default_factory=list)
-    warnings: List[str] = field(default_factory=list)
-    valid: bool = True
+class PgnImportError(Exception):
+    """Custom exception for PGN import errors."""
+    pass
 
 
-class PGNImporter:
+def parse_pgn_file(filepath: Path) -> chess.pgn.Game:
+    """Parse a PGN file and return a chess.pgn.Game object."""
+    if not filepath.exists():
+        raise PgnImportError(f"File not found: {filepath}")
+    with open(filepath, "r") as f:
+        game = chess.pgn.read_game(f)
+    if game is None:
+        raise PgnImportError("Invalid or empty PGN file")
+    return game
+
+
+def extract_metadata(game: chess.pgn.Game) -> Dict[str, str]:
+    """Extract metadata tags from a PGN game."""
+    headers = {}
+    for key in ["Event", "Site", "Date", "Round", "White", "Black", "Result"]:
+        val = game.headers.get(key)
+        if val:
+            headers[key] = val
+    return headers
+
+
+def extract_moves(game: chess.pgn.Game) -> List[str]:
+    """Extract move SAN strings from a PGN game, excluding variations."""
+    moves = []
+    node = game
+    while node.variations:
+        node = node.variations[0]
+        moves.append(node.san())
+    return moves
+
+
+def validate_game_metadata(headers: Dict[str, str]) -> None:
+    """Validate that required metadata is present."""
+    required = ["Event", "White", "Black"]
+    missing = [r for r in required if r not in headers]
+    if missing:
+        raise PgnImportError(f"Missing required metadata: {', '.join(missing)}")
+
+
+def convert_pgn_to_commit_moves(pgn_file: Path) -> List[CommitMove]:
     """
-    Imports a PGN file and validates it against a git repository.
-    
-    The PGN is expected to contain moves that correspond to changes in a git repo.
-    Each move can optionally be annotated with the file path and line range.
+    Convert a PGN file to a list of CommitMove objects.
+    Each move is treated as a commit with a generated hash.
     """
+    game = parse_pgn_file(pgn_file)
+    headers = extract_metadata(game)
+    validate_game_metadata(headers)
+    moves_san = extract_moves(game)
 
-    FILE_ANNOTATION_PATTERN = re.compile(r'\{file: ([^,]+), lines: (\d+)-(\d+)\}')
-
-    def __init__(self, repo_path: Optional[Path] = None):
-        self.repo_path = repo_path
-        self.pgn_path: Optional[Path] = None
-
-    def load_pgn(self, path: Path) -> Optional[chess.pgn.Game]:
-        """Load a PGN file and return the game object."""
-        if not path.exists():
-            return None
-        with open(path, 'r') as f:
-            return chess.pgn.read_game(f)
-
-    def import_game(self, pgn_path: Path) -> PGNImportResult:
-        """Import a PGN file and validate it."""
-        self.pgn_path = pgn_path
-        game = self.load_pgn(pgn_path)
-        if game is None:
-            return PGNImportResult(
-                moves=[],
-                headers={},
-                errors=[f"Could not load PGN from {pgn_path}"],
-                valid=False
-            )
-
-        result = PGNImportResult(
-            headers=dict(game.headers)
-        )
-
-        # Validate required headers
-        required_headers = ['Event', 'Site', 'Date', 'Round', 'White', 'Black']
-        for header in required_headers:
-            if header not in result.headers:
-                result.warnings.append(f"Missing PGN header: {header}")
-
-        # Extract moves
-        board = chess.Board()
-        for node in game.mainline():
-            move = node.move
-            if move is None:
-                continue
-            # Validate move is legal on current board
-            if move not in board.legal_moves:
-                result.errors.append(f"Illegal move: {board.san(move)} at ply {board.fullmove_number}")
-                result.valid = False
-                continue
+    # Create a board to parse SAN moves into UCI
+    board = chess.Board()
+    commit_moves = []
+    for i, san in enumerate(moves_san):
+        try:
+            move = board.parse_san(san)
             board.push(move)
-            result.moves.append(move)
+        except ValueError as e:
+            raise PgnImportError(f"Invalid move at index {i}: {san} - {e}")
+        commit_moves.append(
+            CommitMove(
+                commit_hash=f"pgn-import-{i}",
+                author=headers.get("White") if board.turn == chess.WHITE else headers.get("Black"),
+                message=headers.get("Event", "Imported PGN"),
+                move=move,
+                timestamp="",
+            )
+        )
+    return commit_moves
 
-            # Check for file annotations
-            comment = node.comment
-            if comment:
-                match = self.FILE_ANNOTATION_PATTERN.search(comment)
-                if match:
-                    file_path = match.group(1)
-                    start_line = int(match.group(2))
-                    end_line = int(match.group(3))
-                    # Validate file exists if repo path provided
-                    if self.repo_path:
-                        full_path = self.repo_path / file_path
-                        if not full_path.exists():
-                            result.warnings.append(
-                                f"File {file_path} not found in repository at {self.repo_path}"
-                            )
 
-        result.board = board
-        return result
-
-    def validate_against_repo(self, result: PGNImportResult) -> PGNImportResult:
-        """
-        Validate imported game against the git repository.
-        Checks that file paths exist and line numbers are within bounds.
-        """
-        if self.repo_path is None:
-            result.warnings.append("No repo path provided, skipping repo validation")
-            return result
-
-        # This is a simplified validation - in production, we'd parse the
-        # actual git history and compare moves
-        for i, move in enumerate(result.moves):
-            # Check that the move corresponds to a real file change
-            # For now, just check file existence from annotations
-            pass
-
-        return result
-
-    def import_and_validate(self, pgn_path: Path) -> PGNImportResult:
-        """Import a PGN file and fully validate it."""
-        result = self.import_game(pgn_path)
-        if result.valid:
-            result = self.validate_against_repo(result)
-        return result
-
-    @staticmethod
-    def parse_file_annotation(comment: str) -> Optional[Tuple[str, int, int]]:
-        """
-        Parse a file annotation from a PGN comment.
-        Expected format: {file: path/to/file.py, lines: 10-25}
-        """
-        match = PGNImporter.FILE_ANNOTATION_PATTERN.search(comment)
-        if match:
-            return (match.group(1), int(match.group(2)), int(match.group(3)))
-        return None
-
-    @staticmethod
-    def create_pgn_comment(file_path: str, start_line: int, end_line: int) -> str:
-        """Create a PGN comment with file annotation."""
-        return f"{{file: {file_path}, lines: {start_line}-{end_line}}}
+def import_pgn_to_game(pgn_file: Path, repo_path: Optional[Path] = None) -> "Game":
+    """
+    Import a PGN file and create a Game object.
+    If repo_path is provided, it will be used for display purposes only.
+    """
+    from .game import Game
+    commit_moves = convert_pgn_to_commit_moves(pgn_file)
+    # We don't have a real repo, so we create a minimal Game instance
+    game = Game(
+        repo_path=repo_path or Path("."),
+        branch="imported",
+        commit_moves=commit_moves,
+    )
+    return game
