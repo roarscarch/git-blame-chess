@@ -1,143 +1,164 @@
+"""Import PGN files into git-blame-chess games."""
+
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import chess
 import chess.pgn
 
 from .game import Game, CommitMove
-from .models import path_to_square, EXTENSION_PIECE_MAP, DEFAULT_PIECE
+from .models import piece_to_extension, square_to_path
 
 
-def parse_pgn(pgn_string: str) -> chess.Board:
-    """Parse a PGN string and return the resulting board."""
-    game = chess.pgn.read_game(pgn_string)
-    if game is None:
-        raise ValueError("Invalid PGN: could not parse")
-    board = game.board()
-    for move in game.mainline_moves():
-        board.push(move)
-    return board
-
-
-def import_game_from_pgn(pgn_string: str, repo_path: Optional[str] = None) -> Game:
+def import_pgn(file_path: Path) -> Game:
     """
-    Import a chess game from a PGN string and convert it to a Game object.
-    
-    Each move in the PGN is mapped to a synthetic commit move with:
-    - commit_hash: SHA256 of the move's UCI string (deterministic)
-    - author: taken from PGN tags if available, else "PGN Import"
-    - message: the SAN notation of the move
-    - board_before: the board state before the move
-    - board_after: the board state after the move
-    
-    The file-to-square mapping is preserved by assigning each move to a
-    dummy file path derived from the move's algebraic notation.
+    Import a PGN file and reconstruct a Game object.
+
+    The PGN must contain specific tags that store git metadata:
+    - GitRepo: path to the repository
+    - GitBranch: branch name
+    - GitCommit: list of commit hashes (space-separated)
+    - GitAuthor: list of author names (space-separated)
+    - GitTimestamp: list of UNIX timestamps (space-separated)
+
+    Each move in the PGN corresponds to a CommitMove with the corresponding
+    commit metadata from these tags. The board is reconstructed by replaying
+    all moves.
+
+    Args:
+        file_path: Path to the PGN file.
+
+    Returns:
+        A Game object with all commits and moves replayed.
+
+    Raises:
+        ValueError: If the PGN is malformed or missing required tags.
     """
-    pgn_game = chess.pgn.read_game(pgn_string)
-    if pgn_game is None:
-        raise ValueError("Invalid PGN: could not parse")
-    
+    with open(file_path, "r") as f:
+        game_node = chess.pgn.read_game(f)
+    if game_node is None:
+        raise ValueError("Empty or invalid PGN file")
+
+    headers = game_node.headers
+    # Extract git metadata from headers
+    repo_path = headers.get("GitRepo", "")
+    branch = headers.get("GitBranch", "main")
+    commit_hashes_str = headers.get("GitCommit", "")
+    authors_str = headers.get("GitAuthor", "")
+    timestamps_str = headers.get("GitTimestamp", "")
+
+    commit_hashes = commit_hashes_str.split() if commit_hashes_str else []
+    authors = authors_str.split() if authors_str else []
+    timestamps = [int(ts) for ts in timestamps_str.split() if timestamps_str]
+
+    # Build the list of commits from the PGN headers
+    commits: List[CommitMove] = []
+    # Validate that the number of moves matches the number of commits
+    num_moves = sum(1 for _ in game_node.mainline_moves())
+    if num_moves == 0:
+        raise ValueError("PGN contains no moves")
+    if num_moves != len(commit_hashes):
+        raise ValueError(
+            f"Mismatch between number of moves ({num_moves}) and number of commit hashes ({len(commit_hashes)})"
+        )
+
+    # Replay moves to reconstruct commit moves
     board = chess.Board()
-    moves: List[CommitMove] = []
-    
-    # Extract metadata from PGN tags
-    white = pgn_game.headers.get("White", "White")
-    black = pgn_game.headers.get("Black", "Black")
-    date = pgn_game.headers.get("Date", "????.??.??")
-    event = pgn_game.headers.get("Event", "PGN Import")
-    
-    for i, move in enumerate(pgn_game.mainline_moves()):
-        board_before = board.copy()
+    move_index = 0
+    for node in game_node.mainline():
+        move = node.move
+        if move is None:
+            break
+        # Validate the move is legal on the current board
+        if move not in board.legal_moves:
+            raise ValueError(f"Illegal move {move.uci()} at move {move_index + 1}")
         board.push(move)
-        board_after = board.copy()
-        
-        # Generate a unique but deterministic commit hash
-        commit_hash = hashlib.sha256(move.uci().encode()).hexdigest()[:12]
-        
-        # Determine author based on move parity (white = left, black = right)
-        author = white if i % 2 == 0 else black
-        
-        # Create a synthetic file path from the move's algebraic notation
-        san = board_before.san(move)
-        # Use square names to create a path-like identifier
-        from_sq = chess.SQUARE_NAMES[move.from_square]
-        to_sq = chess.SQUARE_NAMES[move.to_square]
-        file_path = f"pgn/{from_sq}-{to_sq}"
-        
-        # Determine piece type from the moved piece
-        piece = board_before.piece_at(move.from_square)
-        piece_type = piece.piece_type if piece else chess.PAWN
-        
-        # Map piece type to a file extension for consistency
-        ext_to_piece = {v: k for k, v in EXTENSION_PIECE_MAP.items()}
-        extension = ext_to_piece.get(piece_type, ".py")
-        file_path_with_ext = file_path + extension
-        
-        # Compute the square from the file path (for model consistency)
-        square = path_to_square(file_path_with_ext)
-        
-        # Determine number of lines changed (proxy for captures or complexity)
-        lines_changed = 1
-        if board.is_capture(move):
-            lines_changed = 2  # capture = more change
-        if move.promotion:
-            lines_changed = 3  # promotion = significant change
-        
+        commit_hash = commit_hashes[move_index] if move_index < len(commit_hashes) else ""
+        author = authors[move_index] if move_index < len(authors) else ""
+        timestamp = timestamps[move_index] if move_index < len(timestamps) else 0
+        # Determine file path from move (reversing the piece-to-extension mapping)
+        # In a real implementation, the move's square could encode the file path.
+        # For now, we store the move as-is and reconstruct later.
+        file_path_str = ""
+        # Attempt to parse comment for file path
+        if node.comment:
+            # Look for a comment like "file: path/to/file.py"
+            match = re.search(r'file:\s*(\S+)', node.comment)
+            if match:
+                file_path_str = match.group(1)
         commit_move = CommitMove(
             commit_hash=commit_hash,
             author=author,
-            timestamp=i * 60,  # synthetic timestamps (1 minute per move)
-            message=san,
-            files_changed=[file_path_with_ext],
-            lines_added=1,
-            lines_deleted=lines_changed - 1,
-            piece_type=piece_type,
-            from_square=move.from_square,
-            to_square=move.to_square,
-            promotion=move.promotion,
-            capture=board.is_capture(move),
-            board_before=board_before.fen(),
-            board_after=board_after.fen(),
+            timestamp=timestamp,
+            move=move,
+            file_path=file_path_str,
         )
-        moves.append(commit_move)
-    
-    # Create the Game object with imported metadata
-    return Game(
-        repo_path=repo_path or ".",
-        branch="imported",
-        moves=moves,
-        board=chess.Board(),
-        start_board=chess.Board(),
-        current_move_index=0,
-        metadata={
-            "Event": event,
-            "Date": date,
-            "White": white,
-            "Black": black,
-        },
-    )
+        commits.append(commit_move)
+        move_index += 1
+
+    # Create Game object with the reconstructed commits
+    # We need to pass the board state after each move; but Game expects a list of commits.
+    # The Game constructor should accept a list of CommitMove and reconstruct the board.
+    game = Game(repo_path=Path(repo_path) if repo_path else Path("."), branch=branch)
+    game.commits = commits
+    # Replay all moves to set the board
+    game.board = chess.Board()
+    for cm in commits:
+        if cm.move not in game.board.legal_moves:
+            raise ValueError(f"Illegal move {cm.move.uci()} during replay")
+        game.board.push(cm.move)
+    return game
 
 
-def validate_pgn(pgn_string: str) -> Tuple[bool, Optional[str]]:
-    """Validate a PGN string. Returns (is_valid, error_message)."""
+def validate_pgn(file_path: Path) -> Tuple[bool, str]:
+    """
+    Validate a PGN file for import.
+
+    Checks:
+    - File exists and is readable
+    - PGN is well-formed
+    - Contains required git tags
+    - Number of moves matches number of commits
+    - All moves are legal on the reconstructed board
+
+    Args:
+        file_path: Path to the PGN file.
+
+    Returns:
+        Tuple of (is_valid, error_message).
+    """
+    if not file_path.exists():
+        return False, f"File not found: {file_path}"
+    if not file_path.is_file():
+        return False, f"Not a file: {file_path}"
+
     try:
-        game = chess.pgn.read_game(pgn_string)
-        if game is None:
-            return False, "Could not parse PGN (game object is None)"
-        board = game.board()
-        for move in game.mainline_moves():
+        with open(file_path, "r") as f:
+            game_node = chess.pgn.read_game(f)
+        if game_node is None:
+            return False, "Empty or invalid PGN file"
+
+        headers = game_node.headers
+        required_tags = ["GitRepo", "GitBranch", "GitCommit", "GitAuthor", "GitTimestamp"]
+        missing_tags = [tag for tag in required_tags if tag not in headers]
+        if missing_tags:
+            return False, f"Missing required tags: {', '.join(missing_tags)}"
+
+        # Validate move count matches commit count
+        commit_hashes_str = headers.get("GitCommit", "")
+        commit_hashes = commit_hashes_str.split() if commit_hashes_str else []
+        num_moves = sum(1 for _ in game_node.mainline_moves())
+        if num_moves != len(commit_hashes):
+            return False, f"Number of moves ({num_moves}) does not match number of commit hashes ({len(commit_hashes)})"
+
+        # Replay moves to validate legality
+        board = chess.Board()
+        for node in game_node.mainline():
+            move = node.move
+            if move is None:
+                break
             if move not in board.legal_moves:
-                return False, f"Illegal move: {board.san(move)}"
-            board.push(move)
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
-
-def import_game_from_pgn_file(file_path: str, repo_path: Optional[str] = None) -> Game:
-    """Import a game from a PGN file."""
-    with open(file_path, "r") as f:
-        pgn_content = f.read()
-    return import_game_from_pgn(pgn_content, repo_path)
+                return False, f"Illegal move {move.uci()}
