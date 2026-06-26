@@ -40,155 +40,142 @@ class BranchDuel:
         self.state: Optional[DuelState] = None
 
     def initialize(self) -> None:
-        """Initialize duel state from both branches."""
-        try:
-            left_game = Game.from_repo(Path(self.repo.working_dir), branch=self.left_branch)
-            right_game = Game.from_repo(Path(self.repo.working_dir), branch=self.right_branch)
-        except (GitCommandError, ValueError) as e:
-            raise ValueError(f"Failed to load branches: {e}")
-
+        """Initialize the duel state from the two branches."""
+        left_game = Game.from_repo(self.repo.working_tree_dir, branch=self.left_branch)
+        right_game = Game.from_repo(self.repo.working_tree_dir, branch=self.right_branch)
         self.state = DuelState(
             left_game=left_game,
             right_game=right_game,
-            board=chess.Board()
+            board=chess.Board(),
         )
 
-    def get_next_move(self) -> Optional[Tuple[str, chess.Move, int]]:
-        """
-        Get the next move from the current branch.
-        Returns (branch_name, move, commit_index) or None if no more moves.
-        """
+    def get_current_move(self) -> Optional[CommitMove]:
+        """Get the current move for the active branch."""
         if self.state is None:
             return None
-
-        state = self.state
-        if state.current_turn == 0:
-            game = state.left_game
-            idx = state.left_index
-            branch_name = self.left_branch
+        if self.state.current_turn == 0:
+            if self.state.left_index < len(self.state.left_game.moves):
+                return self.state.left_game.moves[self.state.left_index]
         else:
-            game = state.right_game
-            idx = state.right_index
-            branch_name = self.right_branch
-
-        if idx >= len(game.moves):
-            return None
-
-        commit_move = game.moves[idx]
-        move = self._commit_move_to_chess_move(commit_move, state.board)
-        return (branch_name, move, idx)
+            if self.state.right_index < len(self.state.right_game.moves):
+                return self.state.right_game.moves[self.state.right_index]
+        return None
 
     def advance_turn(self) -> None:
-        """Advance to the next turn after a move has been made."""
+        """Advance the turn to the next branch."""
         if self.state is None:
             return
-
-        state = self.state
-        if state.current_turn == 0:
-            state.left_index += 1
+        # Check if current branch has a merge commit that triggers conflict resolution
+        if self.state.current_turn == 0:
+            self.state.left_index += 1
         else:
-            state.right_index += 1
-        state.current_turn = 1 - state.current_turn
+            self.state.right_index += 1
+        self.state.current_turn = 1 - self.state.current_turn
 
-    def _commit_move_to_chess_move(self, commit_move: CommitMove, board: chess.Board) -> chess.Move:
-        """Convert a CommitMove to a chess.Move, handling piece mapping."""
-        from_square = path_to_square(commit_move.file_path, commit_move.added_lines)
-        to_square = path_to_square(commit_move.file_path, commit_move.removed_lines)
-
-        if from_square is None or to_square is None:
-            raise ValueError(f"Could not determine move squares for {commit_move.file_path}")
-
-        piece_type = get_piece_for_path(commit_move.file_path)
-        promotion = None
-
-        # Check for promotion (last rank)
-        if piece_type == chess.PAWN:
-            rank = chess.square_rank(to_square)
-            if rank == 7 or rank == 0:
-                promotion = chess.QUEEN  # auto-queen for now
-
-        move = chess.Move(from_square, to_square, promotion=promotion)
-
-        # Validate move is legal
-        if board.is_legal(move):
-            return move
-
-        # Try to find a legal move that matches the diff
-        for legal_move in board.legal_moves:
-            if legal_move.from_square == from_square and legal_move.to_square == to_square:
-                return legal_move
-
-        raise ValueError(f"No legal move found from {chess.square_name(from_square)} to {chess.square_name(to_square)}")
-
-    def detect_merge_conflict(self) -> bool:
-        """Check if the current position would cause a merge conflict.
-        Returns True if both branches have moved to the same square."""
+    def apply_move(self) -> bool:
+        """Apply the current move to the board. Returns True if successful."""
         if self.state is None:
             return False
-
-        state = self.state
-        if state.left_index >= len(state.left_game.moves) or state.right_index >= len(state.right_game.moves):
+        move = self.get_current_move()
+        if move is None:
             return False
+        # Validate the move against the current board
+        legal_moves = list(self.state.board.legal_moves)
+        # Check if any legal move matches the square mapping
+        for legal in legal_moves:
+            # We map the move squares to the commit move's squares
+            if legal.from_square == move.from_square and legal.to_square == move.to_square:
+                self.state.board.push(legal)
+                return True
+        # If no exact match, try to find a legal move that has same to_square (capture)
+        for legal in legal_moves:
+            if legal.to_square == move.to_square:
+                self.state.board.push(legal)
+                return True
+        # If still no match, it might be a conflict or illegal move
+        self.state.conflict_squares.append(move.to_square)
+        return False
 
-        left_move = state.left_game.moves[state.left_index]
-        right_move = state.right_game.moves[state.right_index]
+    def detect_conflicts(self) -> List[Tuple[str, chess.Square]]:
+        """Detect conflicts between the two branches at the current state.
+        Returns list of (branch_name, square) tuples where conflicts exist."""
+        if self.state is None:
+            return []
+        conflicts: List[Tuple[str, chess.Square]] = []
+        # Compare the next moves from both branches
+        left_move = None
+        right_move = None
+        if self.state.left_index < len(self.state.left_game.moves):
+            left_move = self.state.left_game.moves[self.state.left_index]
+        if self.state.right_index < len(self.state.right_game.moves):
+            right_move = self.state.right_game.moves[self.state.right_index]
+        if left_move and right_move:
+            # A conflict occurs if both moves try to move to the same square
+            if left_move.to_square == right_move.to_square:
+                conflicts.append((self.left_branch, left_move.to_square))
+                conflicts.append((self.right_branch, right_move.to_square))
+            # Also conflict if one move captures a piece that the other needs
+            if self.state.board.piece_at(left_move.to_square) and self.state.board.piece_at(right_move.to_square):
+                if left_move.to_square == right_move.to_square:
+                    pass  # already added
+        return conflicts
 
-        left_to = path_to_square(left_move.file_path, left_move.removed_lines)
-        right_to = path_to_square(right_move.file_path, right_move.removed_lines)
-
-        if left_to is not None and right_to is not None and left_to == right_to:
-            state.conflict_squares.append(left_to)
+    def resolve_conflict(self, square: chess.Square) -> bool:
+        """Resolve a conflict by merging the two moves at the given square.
+        This simulates a merge commit by combining the two moves.
+        Returns True if the conflict was resolved."""
+        if self.state is None:
+            return False
+        # Get the conflicting moves
+        left_move = None
+        right_move = None
+        if self.state.left_index < len(self.state.left_game.moves):
+            left_move = self.state.left_game.moves[self.state.left_index]
+        if self.state.right_index < len(self.state.right_game.moves):
+            right_move = self.state.right_game.moves[self.state.right_index]
+        if left_move is None or right_move is None:
+            return False
+        # Create a merge move that combines both: move left piece to square, then right piece to square
+        # This is a simplified resolution; in practice, we'd need to handle the merge commit properly
+        merge_move = chess.Move(left_move.from_square, square)
+        if merge_move in self.state.board.legal_moves:
+            self.state.board.push(merge_move)
+            # Now advance both branches past the conflict
+            self.state.left_index += 1
+            self.state.right_index += 1
+            # Remove from conflict list
+            if square in self.state.conflict_squares:
+                self.state.conflict_squares.remove(square)
             return True
         return False
 
-    def resolve_conflict(self) -> Optional[chess.Move]:
-        """Resolve a merge conflict by choosing a move that avoids conflict.
-        Returns the resolved move or None if cannot resolve."""
-        if self.state is None or not self.state.conflict_squares:
-            return None
-
-        state = self.state
-        conflict_square = state.conflict_squares[-1]
-
-        # Try to find alternative moves for the current branch
-        if state.current_turn == 0:
-            game = state.left_game
-            idx = state.left_index
-        else:
-            game = state.right_game
-            idx = state.right_index
-
-        if idx >= len(game.moves):
-            return None
-
-        commit_move = game.moves[idx]
-        board = state.board.copy()
-
-        # Try all legal moves that don't go to conflict square
-        for legal_move in board.legal_moves:
-            if legal_move.to_square != conflict_square:
-                # Check if this move is somewhat related to the diff
-                from_square = path_to_square(commit_move.file_path, commit_move.added_lines)
-                if from_square is not None and legal_move.from_square == from_square:
-                    return legal_move
-
-        return None
-
-    def apply_merge(self) -> None:
-        """Apply a merge commit: reset board to common ancestor and continue."""
+    def is_finished(self) -> bool:
+        """Check if the duel is finished (both branches have no more moves)."""
         if self.state is None:
-            return
+            return True
+        return (self.state.left_index >= len(self.state.left_game.moves) and
+                self.state.right_index >= len(self.state.right_game.moves))
 
-        state = self.state
-        # Find common ancestor (for simplicity, reset to initial board)
-        state.board = chess.Board()
-        state.left_index = 0
-        state.right_index = 0
-        state.current_turn = 0
-        state.merge_commit = None
-        state.conflict_squares.clear()
-
-    def get_game_status(self) -> Dict[str, object]:
-        """Get current status of the duel."""
+    def get_scores(self) -> Tuple[int, int]:
+        """Get the scores (number of pieces captured) for left and right branches."""
         if self.state is None:
-            return {"error": "Not initialized"}
+            return (0, 0)
+        # Count captures as the number of pieces that have been taken
+        # This is a simple heuristic; in practice, we'd track captures more precisely
+        left_captures = 0
+        right_captures = 0
+        # Walk through the move history and count captures
+        for move in self.state.board.move_stack:
+            if self.state.board.is_capture(move):
+                # Determine which branch made this move
+                # This is a simplified approach; we'd need to track which branch made each move
+                if len(self.state.board.move_stack) % 2 == 0:
+                    right_captures += 1
+                else:
+                    left_captures += 1
+        return (left_captures, right_captures)
+
+    def get_board_state(self) -> chess.Board:
+        """Get the current board state."""
+        if self.state is None:
+            return chess.Board()
