@@ -1,101 +1,105 @@
 from __future__ import annotations
 
-import re
-from pathlib import Path
-from typing import Dict, List, Optional
-
 import chess
 import chess.pgn
-
-from .models import CommitMove, EXTENSION_PIECE_MAP
-
-
-class PgnImportError(Exception):
-    """Custom exception for PGN import errors."""
-    pass
+from pathlib import Path
+from typing import Optional, Tuple, List
+from dataclasses import dataclass
+from .models import EXTENSION_PIECE_MAP, get_piece_for_path, path_to_square
+from .game import Game, CommitMove
 
 
-def parse_pgn_file(filepath: Path) -> chess.pgn.Game:
-    """Parse a PGN file and return a chess.pgn.Game object."""
-    if not filepath.exists():
-        raise PgnImportError(f"File not found: {filepath}")
-    with open(filepath, "r") as f:
-        game = chess.pgn.read_game(f)
-    if game is None:
-        raise PgnImportError("Invalid or empty PGN file")
-    return game
+@dataclass
+class ImportedGame:
+    """Represents a PGN game imported for replay."""
+    headers: dict[str, str]
+    moves: List[chess.Move]
+    final_board: chess.Board
 
 
-def extract_metadata(game: chess.pgn.Game) -> Dict[str, str]:
-    """Extract metadata tags from a PGN game."""
-    headers = {}
-    for key in ["Event", "Site", "Date", "Round", "White", "Black", "Result"]:
-        val = game.headers.get(key)
-        if val:
-            headers[key] = val
-    return headers
+def parse_pgn_file(pgn_path: Path) -> Optional[ImportedGame]:
+    """Parse a PGN file and return an ImportedGame object."""
+    if not pgn_path.exists():
+        return None
+    try:
+        with open(pgn_path, 'r', encoding='utf-8') as f:
+            game = chess.pgn.read_game(f)
+        if game is None:
+            return None
+        headers = dict(game.headers)
+        moves: List[chess.Move] = []
+        node = game
+        while node.variations:
+            node = node.variations[0]
+            moves.append(node.move)
+        final_board = game.end().board()
+        return ImportedGame(headers=headers, moves=moves, final_board=final_board)
+    except (ValueError, OSError) as e:
+        print(f"Error parsing PGN file: {e}")
+        return None
 
 
-def extract_moves(game: chess.pgn.Game) -> List[str]:
-    """Extract move SAN strings from a PGN game, excluding variations."""
-    moves = []
-    node = game
-    while node.variations:
-        node = node.variations[0]
-        moves.append(node.san())
-    return moves
-
-
-def validate_game_metadata(headers: Dict[str, str]) -> None:
-    """Validate that required metadata is present."""
-    required = ["Event", "White", "Black"]
-    missing = [r for r in required if r not in headers]
-    if missing:
-        raise PgnImportError(f"Missing required metadata: {', '.join(missing)}")
-
-
-def convert_pgn_to_commit_moves(pgn_file: Path) -> List[CommitMove]:
-    """
-    Convert a PGN file to a list of CommitMove objects.
-    Each move is treated as a commit with a generated hash.
-    """
-    game = parse_pgn_file(pgn_file)
-    headers = extract_metadata(game)
-    validate_game_metadata(headers)
-    moves_san = extract_moves(game)
-
-    # Create a board to parse SAN moves into UCI
+def validate_pgn_game(imported: ImportedGame) -> bool:
+    """Validate that the imported game follows expected structure."""
+    # Check that the game has at least one move
+    if not imported.moves:
+        print("PGN game has no moves.")
+        return False
+    # Validate that the final board is consistent with the move list
     board = chess.Board()
-    commit_moves = []
-    for i, san in enumerate(moves_san):
-        try:
-            move = board.parse_san(san)
-            board.push(move)
-        except ValueError as e:
-            raise PgnImportError(f"Invalid move at index {i}: {san} - {e}")
-        commit_moves.append(
-            CommitMove(
-                commit_hash=f"pgn-import-{i}",
-                author=headers.get("White") if board.turn == chess.WHITE else headers.get("Black"),
-                message=headers.get("Event", "Imported PGN"),
-                move=move,
-                timestamp="",
-            )
+    for move in imported.moves:
+        if move not in board.legal_moves:
+            print(f"Move {move} is not legal in position: {board.fen()}")
+            return False
+        board.push(move)
+    return True
+
+
+def load_pgn_into_game(pgn_path: Path, repo_path: Path = Path('.'), branch: Optional[str] = None) -> Optional[Game]:
+    """
+    Load a PGN file and convert it into a Game object for replay.
+    Uses dummy commit hashes based on move index.
+    """
+    imported = parse_pgn_file(pgn_path)
+    if imported is None:
+        print(f"Could not parse PGN file: {pgn_path}")
+        return None
+    
+    if not validate_pgn_game(imported):
+        print("PGN validation failed.")
+        return None
+    
+    # Build a Game from the moves
+    game = Game(repo_path=repo_path, branch=branch or "pgn_import")
+    game.board = chess.Board()
+    game.moves = []
+    game.commit_moves = []
+    
+    board = chess.Board()
+    for i, move in enumerate(imported.moves):
+        # Generate a fake commit hash
+        fake_sha = f"pgn-import-{i:08d}"
+        # Determine piece type from the moved piece
+        piece = board.piece_at(move.from_square)
+        if piece is None:
+            print(f"No piece at source square {move.from_square} for move {i}")
+            return None
+        piece_type = piece.piece_type
+        # Build a CommitMove with dummy diff info
+        commit_move = CommitMove(
+            commit_sha=fake_sha,
+            author="PGN Import",
+            message=f"PGN move {i+1}: {move.uci()}",
+            piece_type=piece_type,
+            from_square=move.from_square,
+            to_square=move.to_square,
+            capture=board.is_capture(move),
+            promotion=move.promotion,
         )
-    return commit_moves
-
-
-def import_pgn_to_game(pgn_file: Path, repo_path: Optional[Path] = None) -> "Game":
-    """
-    Import a PGN file and create a Game object.
-    If repo_path is provided, it will be used for display purposes only.
-    """
-    from .game import Game
-    commit_moves = convert_pgn_to_commit_moves(pgn_file)
-    # We don't have a real repo, so we create a minimal Game instance
-    game = Game(
-        repo_path=repo_path or Path("."),
-        branch="imported",
-        commit_moves=commit_moves,
-    )
+        game.commit_moves.append(commit_move)
+        game.moves.append(move)
+        board.push(move)
+    
+    game.board = board
+    game.current_index = len(game.moves) - 1
     return game
