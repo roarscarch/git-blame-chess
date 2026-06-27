@@ -1,84 +1,138 @@
 from __future__ import annotations
 
-import re
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Dict, List, Optional, TextIO
-
 import chess
 import chess.pgn
+from typing import List, Optional
+from io import StringIO
+from dataclasses import dataclass, field
 
 from .game import Game, CommitMove
-from .models import get_piece_for_path, path_to_square
+from .models import piece_type_from_extension
 
 
-def _sanitize_tag(value: str) -> str:
-    """Remove problematic characters from PGN tag values."""
-    return re.sub(r'[\r\n"]', ' ', value).strip()
+@dataclass
+class ExportOptions:
+    """Options for PGN export."""
+    include_annotations: bool = True
+    include_comments: bool = True
+    include_clock: bool = False
+    event_name: str = "Git Blame Chess"
+    site: str = "local"
+    date: str = "????.??.??"
+    round: str = "-"
 
 
-def _build_metadata(game: Game) -> Dict[str, str]:
-    """Build PGN metadata tags from the game and its repository."""
-    repo = game.repo
-    active_branch = repo.active_branch.name if not repo.head.is_detached else "HEAD"
-    
-    try:
-        remote_url = repo.remotes.origin.url if repo.remotes else ""
-    except Exception:
-        remote_url = ""
-    
-    meta: Dict[str, str] = {
-        "Event": "Git Blame Chess",
-        "Site": _sanitize_tag(remote_url) if remote_url else str(game.repo_path.resolve()),
-        "Date": datetime.now(timezone.utc).strftime("%Y.%m.%d"),
-        "Round": "1",
-        "White": _sanitize_tag(active_branch),
-        "Black": _sanitize_tag(active_branch),  # same branch for single-branch play
-        "Result": "*",  # unknown until game ends
-        "Annotator": "git-blame-chess",
-        "Source": f"Git repository: {_sanitize_tag(str(game.repo_path.resolve()))}",
-        "Branch": _sanitize_tag(active_branch),
-    }
-    
-    # Add commit count as a custom tag
-    meta["PlyCount"] = str(len(game.moves))
-    
-    # If there's a starting commit, include its hash
-    if game.moves:
-        first_move = game.moves[0]
-        meta["WhiteTeam"] = first_move.commit.hexsha[:8]
-    
-    return meta
+class GameExporter:
+    """Export a game to PGN format."""
+
+    def __init__(self, game: Game, options: Optional[ExportOptions] = None) -> None:
+        self.game = game
+        self.options = options or ExportOptions()
+
+    def to_pgn_string(self) -> str:
+        """Export the game as a PGN string."""
+        game_node = self._build_game_node()
+        exporter = chess.pgn.StringExporter(headers=True, variations=True, comments=True)
+        return game_node.accept(exporter)
+
+    def to_file(self, path: str) -> None:
+        """Export the game to a PGN file."""
+        pgn_str = self.to_pgn_string()
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(pgn_str)
+
+    def _build_game_node(self) -> chess.pgn.Game:
+        """Build a PGN game tree from the game's move list."""
+        game = chess.pgn.Game()
+        game.headers["Event"] = self.options.event_name
+        game.headers["Site"] = self.options.site
+        game.headers["Date"] = self.options.date
+        game.headers["Round"] = self.options.round
+        game.headers["White"] = self._get_player_name(chess.WHITE)
+        game.headers["Black"] = self._get_player_name(chess.BLACK)
+        game.headers["Result"] = self._get_result()
+
+        # Add repository info as a custom header
+        repo_path = str(self.game.repo_path.resolve()) if hasattr(self.game, 'repo_path') else "unknown"
+        game.headers["Site"] = repo_path
+
+        # Build move tree
+        node = game
+        board = chess.Board()
+
+        for i, move in enumerate(self.game.moves):
+            if move.move is None:
+                continue
+
+            # Create a new node for this move
+            node = node.add_variation(move.move)
+
+            if self.options.include_comments:
+                comment = self._build_comment(move, i)
+                if comment:
+                    node.comment = comment
+
+            # Apply move to board for validation
+            try:
+                board.push(move.move)
+            except ValueError:
+                # If the move is illegal in the current board state, skip it
+                continue
+
+        return game
+
+    def _get_player_name(self, color: chess.Color) -> str:
+        """Get the player name for a given color."""
+        if hasattr(self.game, 'branch_name'):
+            branch = self.game.branch_name
+            return f"{branch} ({'White' if color == chess.WHITE else 'Black'})"
+        return f"Branch-{'White' if color == chess.WHITE else 'Black'}"
+
+    def _get_result(self) -> str:
+        """Get the game result string."""
+        if not self.game.moves:
+            return "*"
+        board = self.game.current_board() if hasattr(self.game, 'current_board') else chess.Board()
+        if board.is_checkmate():
+            winner = "White" if board.turn == chess.BLACK else "Black"
+            return f"1-0" if winner == "White" else "0-1"
+        if board.is_stalemate() or board.is_insufficient_material():
+            return "1/2-1/2"
+        return "*"
+
+    def _build_comment(self, move: CommitMove, index: int) -> str:
+        """Build a comment string for a move."""
+        parts = []
+
+        if move.commit_hash:
+            parts.append(f"commit: {move.commit_hash[:7]}")
+
+        if move.files_changed:
+            files_str = ", ".join(move.files_changed[:3])
+            if len(move.files_changed) > 3:
+                files_str += f" (+{len(move.files_changed) - 3} more)"
+            parts.append(f"files: {files_str}")
+
+        if move.author:
+            parts.append(f"author: {move.author}")
+
+        if move.message:
+            # Truncate commit message for comment
+            msg = move.message.strip().split('\n')[0]
+            if len(msg) > 60:
+                msg = msg[:57] + "..."
+            parts.append(f"msg: {msg}")
+
+        return " | ".join(parts)
 
 
-def _build_move_annotation(move: CommitMove) -> str:
-    """Build a commentary annotation for a commit move."""
-    parts = []
-    
-    # Commit message (first line)
-    msg = move.commit.message.split('\n')[0].strip()
-    if msg:
-        parts.append(msg)
-    
-    # Files changed
-    if move.files_changed:
-        files_str = ", ".join(move.files_changed[:5])  # limit to 5 files
-        if len(move.files_changed) > 5:
-            files_str += f" (+{len(move.files_changed) - 5} more)"
-        parts.append(f"Files: {files_str}")
-    
-    # Author
-    author = move.commit.author.name if move.commit.author else "unknown"
-    parts.append(f"Author: {author}")
-    
-    return " | ".join(parts)
+def export_game(game: Game, path: str, options: Optional[ExportOptions] = None) -> None:
+    """Convenience function to export a game to a PGN file."""
+    exporter = GameExporter(game, options)
+    exporter.to_file(path)
 
 
-def export_pgn(game: Game, output: Optional[TextIO] = None, include_annotations: bool = True) -> str:
-    """
-    Export the game as a PGN string.
-    
-    Args:
-        game: The Game instance to export.
-        output: Optional file-like object to write to. If None, returns the PGN as a string.
-        include_annotations: Whether to include commit annotations in braces {}
+def export_game_to_string(game: Game, options: Optional[ExportOptions] = None) -> str:
+    """Convenience function to export a game as a PGN string."""
+    exporter = GameExporter(game, options)
+    return exporter.to_pgn_string()
