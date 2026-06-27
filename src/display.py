@@ -39,138 +39,123 @@ def render_board(
     last_move: chess.Move | None = None,
     legal_moves: set[chess.Square] | None = None,
     highlight_squares: set[chess.Square] | None = None,
+    show_coords: bool = True,
 ) -> str:
     """Render a chess board as a colored string for terminal output.
 
     Args:
         board: The chess board to render.
-        last_move: The last move played (to highlight from/to squares).
-        legal_moves: Set of squares that are legal move destinations.
+        last_move: The last move made (to highlight from/to squares).
+        legal_moves: Set of squares that are legal move targets for the current side.
         highlight_squares: Additional squares to highlight (e.g., selected piece).
+        show_coords: Whether to show rank/file labels.
 
     Returns:
-        A string with ANSI color codes suitable for printing.
+        A string representation of the board with ANSI color codes.
     """
-    if highlight_squares is None:
-        highlight_squares = set()
-    if legal_moves is None:
-        legal_moves = set()
-
-    lines: list[str] = []
-    # Top coordinate label
-    lines.append('  ' + ' '.join(f'{COLOR_COORD_LABEL}{chr(ord("a") + col)}{COLOR_RESET}' for col in range(8)))
-
-    for row in range(7, -1, -1):
-        line_parts: list[str] = []
-        # Row label
-        line_parts.append(f'{COLOR_COORD_LABEL}{row + 1}{COLOR_RESET}')
-
-        for col in range(8):
-            square = chess.square(col, row)
+    lines = []
+    
+    # Determine which squares to highlight
+    highlighted: set[chess.Square] = set()
+    if highlight_squares:
+        highlighted.update(highlight_squares)
+    if legal_moves:
+        highlighted.update(legal_moves)
+    if last_move:
+        highlighted.add(last_move.from_square)
+        highlighted.add(last_move.to_square)
+    
+    # Build the board row by row (rank 8 to rank 1)
+    for rank in range(7, -1, -1):
+        row_parts = []
+        if show_coords:
+            row_parts.append(f"{COLOR_COORD_LABEL}{rank + 1} {COLOR_RESET}")
+        for file in range(8):
+            square = rank * 8 + file
             piece = board.piece_at(square)
-
+            is_light = square_color(square)
+            
             # Determine background color
-            if square in highlight_squares:
-                bg = COLOR_HIGHLIGHT
-            elif last_move and (square == last_move.from_square or square == last_move.to_square):
-                bg = COLOR_LAST_MOVE
-            elif square in legal_moves:
-                bg = COLOR_LEGAL_MOVE
-            elif square_color(square):
-                bg = COLOR_WHITE_SQUARE
-            else:
-                bg = COLOR_BLACK_SQUARE
-
-            # Determine piece color
-            if piece:
-                if piece.color == chess.WHITE:
-                    fg = COLOR_WHITE_PIECE
+            if square in highlighted:
+                if square == last_move.from_square or square == last_move.to_square:
+                    bg = COLOR_LAST_MOVE
+                elif legal_moves and square in legal_moves:
+                    bg = COLOR_LEGAL_MOVE
                 else:
-                    fg = COLOR_BLACK_PIECE
-                symbol = get_piece_symbol(piece)
+                    bg = COLOR_HIGHLIGHT
             else:
-                fg = ''
-                symbol = ' '
-
-            line_parts.append(f'{bg}{fg} {symbol} {COLOR_RESET}')
-
-        lines.append(''.join(line_parts))
-
-    # Bottom coordinate label
-    lines.append('  ' + ' '.join(f'{COLOR_COORD_LABEL}{chr(ord("a") + col)}{COLOR_RESET}' for col in range(8)))
-
-    return '\n'.join(lines)
-
-
-def render_move(move: chess.Move, board: chess.Board, san: bool = True) -> str:
-    """Render a chess move in SAN notation or UCI."""
-    if san:
-        try:
-            return board.san(move)
-        except ValueError:
-            return move.uci()
-    return move.uci()
+                bg = COLOR_WHITE_SQUARE if is_light else COLOR_BLACK_SQUARE
+            
+            # Piece symbol and color
+            if piece:
+                piece_color = COLOR_WHITE_PIECE if piece.color == chess.WHITE else COLOR_BLACK_PIECE
+                symbol = get_piece_symbol(piece)
+                cell = f"{bg}{piece_color} {symbol} {COLOR_RESET}"
+            else:
+                cell = f"{bg}   {COLOR_RESET}"
+            row_parts.append(cell)
+        lines.append("".join(row_parts))
+    
+    if show_coords:
+        file_labels = "   " + "".join(f" {chr(ord('a') + f)}  " for f in range(8))
+        lines.append(f"{COLOR_COORD_LABEL}{file_labels}{COLOR_RESET}")
+    
+    return "\
+".join(lines)
 
 
-def print_board(
+def render_move_info(
+    move: chess.Move | None,
     board: chess.Board,
-    last_move: chess.Move | None = None,
-    legal_moves: set[chess.Square] | None = None,
-    highlight_squares: set[chess.Square] | None = None,
-) -> None:
-    """Print a colored board to the terminal."""
-    print(render_board(board, last_move, legal_moves, highlight_squares))
-
-
-def print_game_status(board: chess.Board) -> None:
-    """Print the current game status (check, checkmate, stalemate, etc.)."""
-    if board.is_checkmate():
-        winner = 'White' if board.turn == chess.BLACK else 'Black'
-        print(f'Checkmate! {winner} wins.')
-    elif board.is_stalemate():
-        print('Stalemate! The game is a draw.')
-    elif board.is_insufficient_material():
-        print('Draw due to insufficient material.')
-    elif board.is_check():
-        print('Check!')
-    else:
-        print(f"Turn: {'White' if board.turn == chess.WHITE else 'Black'}")
-
-
-def render_move_history(moves: list[chess.Move], board: chess.Board) -> str:
-    """Render the move history in algebraic notation.
+    move_number: int,
+    turn: bool,
+) -> str:
+    """Render information about the current move.
 
     Args:
-        moves: List of moves played.
-        board: The board to use for SAN generation.
+        move: The move object, or None if no move has been made.
+        board: The board state after the move.
+        move_number: The current move number (fullmove count).
+        turn: True if it's white's turn, False for black.
 
     Returns:
-        A string with move numbers and SAN notation.
+        A string describing the move and current turn.
     """
-    lines: list[str] = []
-    temp_board = board.copy()
-    temp_board.clear()
-    # We need to replay moves on a fresh board to get correct SAN
-    # Actually, we'll just use the provided board which is assumed to be at the start
-    # Better: replay from initial position
-    replay_board = chess.Board()
-    move_number = 1
-    line = ''
-    for i, move in enumerate(moves):
-        try:
-            san = replay_board.san(move)
-        except ValueError:
-            san = move.uci()
-        replay_board.push(move)
-        if i % 2 == 0:
-            line = f'{move_number}. {san}'
-            if i == len(moves) - 1:
-                lines.append(line)
-        else:
-            line += f' {san}'
-            lines.append(line)
-            move_number += 1
-            line = ''
-    if line:
-        lines.append(line)
-    return '\n'.join(lines)
+    if move is None:
+        return f"Move {move_number}: {'White' if turn else 'Black'} to move"
+    
+    # Get SAN notation
+    board_copy = board.copy()
+    board_copy.push(move)
+    san = board_copy.san(move)
+    
+    turn_str = "White" if turn else "Black"
+    return f"Move {move_number}: {turn_str} played {san}"
+
+
+def render_game_status(
+    board: chess.Board,
+    move_number: int,
+    turn: bool,
+    game_over: bool = False,
+    result: str | None = None,
+) -> str:
+    """Render the current game status line.
+
+    Args:
+        board: The current board state.
+        move_number: The current move number.
+        turn: True if it's white's turn, False for black.
+        game_over: Whether the game has ended.
+        result: The game result (e.g., "1-0", "0-1", "1/2-1/2").
+
+    Returns:
+        A string describing the game status.
+    """
+    if game_over:
+        if result:
+            return f"Game over: {result}"
+        return "Game over"
+    
+    turn_str = "White" if turn else "Black"
+    return f"Move {move_number}: {turn_str}
