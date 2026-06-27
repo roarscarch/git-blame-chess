@@ -1,63 +1,84 @@
 from __future__ import annotations
 
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, TextIO
+
 import chess
 import chess.pgn
-from datetime import datetime
-from pathlib import Path
-from typing import Optional, List, Dict, Any
 
 from .game import Game, CommitMove
-from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE
+from .models import get_piece_for_path, path_to_square
 
 
-def export_game_to_pgn(
-    game: Game,
-    output_path: Path,
-    repo_name: str = "",
-    branch: str = "",
-    author: str = "",
-    date: Optional[datetime] = None,
-    annotations: Optional[List[str]] = None,
-) -> Path:
+def _sanitize_tag(value: str) -> str:
+    """Remove problematic characters from PGN tag values."""
+    return re.sub(r'[\r\n"]', ' ', value).strip()
+
+
+def _build_metadata(game: Game) -> Dict[str, str]:
+    """Build PGN metadata tags from the game and its repository."""
+    repo = game.repo
+    active_branch = repo.active_branch.name if not repo.head.is_detached else "HEAD"
+    
+    try:
+        remote_url = repo.remotes.origin.url if repo.remotes else ""
+    except Exception:
+        remote_url = ""
+    
+    meta: Dict[str, str] = {
+        "Event": "Git Blame Chess",
+        "Site": _sanitize_tag(remote_url) if remote_url else str(game.repo_path.resolve()),
+        "Date": datetime.now(timezone.utc).strftime("%Y.%m.%d"),
+        "Round": "1",
+        "White": _sanitize_tag(active_branch),
+        "Black": _sanitize_tag(active_branch),  # same branch for single-branch play
+        "Result": "*",  # unknown until game ends
+        "Annotator": "git-blame-chess",
+        "Source": f"Git repository: {_sanitize_tag(str(game.repo_path.resolve()))}",
+        "Branch": _sanitize_tag(active_branch),
+    }
+    
+    # Add commit count as a custom tag
+    meta["PlyCount"] = str(len(game.moves))
+    
+    # If there's a starting commit, include its hash
+    if game.moves:
+        first_move = game.moves[0]
+        meta["WhiteTeam"] = first_move.commit.hexsha[:8]
+    
+    return meta
+
+
+def _build_move_annotation(move: CommitMove) -> str:
+    """Build a commentary annotation for a commit move."""
+    parts = []
+    
+    # Commit message (first line)
+    msg = move.commit.message.split('\n')[0].strip()
+    if msg:
+        parts.append(msg)
+    
+    # Files changed
+    if move.files_changed:
+        files_str = ", ".join(move.files_changed[:5])  # limit to 5 files
+        if len(move.files_changed) > 5:
+            files_str += f" (+{len(move.files_changed) - 5} more)"
+        parts.append(f"Files: {files_str}")
+    
+    # Author
+    author = move.commit.author.name if move.commit.author else "unknown"
+    parts.append(f"Author: {author}")
+    
+    return " | ".join(parts)
+
+
+def export_pgn(game: Game, output: Optional[TextIO] = None, include_annotations: bool = True) -> str:
     """
-    Export a Game object to a PGN file with metadata and move annotations.
-
+    Export the game as a PGN string.
+    
     Args:
         game: The Game instance to export.
-        output_path: Path where the PGN file will be written.
-        repo_name: Name of the repository (for event tag).
-        branch: Branch name (for site tag).
-        author: Author of the game (for player names).
-        date: Date of the game (default: current date).
-        annotations: Optional list of comment strings per move (in order).
-
-    Returns:
-        The Path to the written PGN file.
-    """
-    if date is None:
-        date = datetime.now()
-
-    # Create a new PGN game node
-    pgn_game = chess.pgn.Game()
-    pgn_game.headers["Event"] = f"Git Blame Chess: {repo_name}" if repo_name else "Git Blame Chess"
-    pgn_game.headers["Site"] = branch if branch else "local"
-    pgn_game.headers["Date"] = date.strftime("%Y.%m.%d")
-    pgn_game.headers["Round"] = "1"
-    pgn_game.headers["White"] = author if author else "White"
-    pgn_game.headers["Black"] = "Black"
-    pgn_game.headers["Result"] = "*"  # Unknown result
-
-    # Build the move list with optional annotations
-    node = pgn_game
-    for i, move in enumerate(game.history):
-        # Convert CommitMove to a chess.Move
-        chess_move = chess.Move(move.from_square, move.to_square, move.promotion)
-        if not game.board.is_legal(chess_move):
-            continue  # Skip illegal moves (should not happen in valid games)
-        game.board.push(chess_move)
-        node = node.add_variation(chess_move)
-        # Add annotation if provided
-        if annotations and i < len(annotations):
-            node.comment = annotations[i]
-        # Add commit hash as a comment
-        node.comment = f"commit: {move.commit_hash[:7]}
+        output: Optional file-like object to write to. If None, returns the PGN as a string.
+        include_annotations: Whether to include commit annotations in braces {}
