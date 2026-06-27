@@ -4,12 +4,12 @@ import chess
 
 # Unicode chess piece symbols
 PIECE_SYMBOLS = {
-    chess.PAWN: {True: '♙', False: '♟'},
-    chess.KNIGHT: {True: '♘', False: '♞'},
-    chess.BISHOP: {True: '♗', False: '♝'},
-    chess.ROOK: {True: '♖', False: '♜'},
-    chess.QUEEN: {True: '♕', False: '♛'},
-    chess.KING: {True: '♔', False: '♚'},
+    chess.PAWN: {True: '\u2659', False: '\u265F'},
+    chess.KNIGHT: {True: '\u2658', False: '\u265E'},
+    chess.BISHOP: {True: '\u2657', False: '\u265D'},
+    chess.ROOK: {True: '\u2656', False: '\u265C'},
+    chess.QUEEN: {True: '\u2655', False: '\u265B'},
+    chess.KING: {True: '\u2654', False: '\u265A'},
 }
 
 # ANSI color codes for terminal output
@@ -40,7 +40,7 @@ def render_board(
     legal_moves: set[chess.Square] | None = None,
     highlight_squares: set[chess.Square] | None = None,
 ) -> str:
-    """Render the board as a colored string for terminal output.
+    """Render a chess board as a colored string for terminal output.
 
     Args:
         board: The chess board to render.
@@ -49,80 +49,128 @@ def render_board(
         highlight_squares: Additional squares to highlight (e.g., selected piece).
 
     Returns:
-        A string with ANSI escape codes for colored terminal output.
+        A string with ANSI color codes suitable for printing.
     """
-    if legal_moves is None:
-        legal_moves = set()
     if highlight_squares is None:
         highlight_squares = set()
+    if legal_moves is None:
+        legal_moves = set()
 
     lines: list[str] = []
-    # Column labels
-    col_labels = '  a  b  c  d  e  f  g  h'
-    lines.append(col_labels)
-    lines.append('  ' + '-' * 33)
+    # Top coordinate label
+    lines.append('  ' + ' '.join(f'{COLOR_COORD_LABEL}{chr(ord("a") + col)}{COLOR_RESET}' for col in range(8)))
 
-    for rank in range(7, -1, -1):
-        row = f'{rank + 1} |'
-        for file in range(8):
-            square = chess.square(file, rank)
+    for row in range(7, -1, -1):
+        line_parts: list[str] = []
+        # Row label
+        line_parts.append(f'{COLOR_COORD_LABEL}{row + 1}{COLOR_RESET}')
+
+        for col in range(8):
+            square = chess.square(col, row)
             piece = board.piece_at(square)
-            is_light = square_color(square)
-            bg = COLOR_WHITE_SQUARE if is_light else COLOR_BLACK_SQUARE
 
-            # Determine if this square should be highlighted
-            if last_move:
-                if square == last_move.from_square or square == last_move.to_square:
-                    bg = COLOR_LAST_MOVE
-            if square in legal_moves:
-                bg = COLOR_LEGAL_MOVE
+            # Determine background color
             if square in highlight_squares:
                 bg = COLOR_HIGHLIGHT
-
-            if piece:
-                symbol = get_piece_symbol(piece)
-                fg = COLOR_WHITE_PIECE if piece.color else COLOR_BLACK_PIECE
-                row += f'{bg}{fg} {symbol} {COLOR_RESET}'
+            elif last_move and (square == last_move.from_square or square == last_move.to_square):
+                bg = COLOR_LAST_MOVE
+            elif square in legal_moves:
+                bg = COLOR_LEGAL_MOVE
+            elif square_color(square):
+                bg = COLOR_WHITE_SQUARE
             else:
-                if is_light:
-                    row += f'{bg}   {COLOR_RESET}'
-                else:
-                    row += f'{bg}   {COLOR_RESET}'
-        row += f'| {rank + 1}'
-        lines.append(row)
+                bg = COLOR_BLACK_SQUARE
 
-    lines.append('  ' + '-' * 33)
-    lines.append(col_labels)
+            # Determine piece color
+            if piece:
+                if piece.color == chess.WHITE:
+                    fg = COLOR_WHITE_PIECE
+                else:
+                    fg = COLOR_BLACK_PIECE
+                symbol = get_piece_symbol(piece)
+            else:
+                fg = ''
+                symbol = ' '
+
+            line_parts.append(f'{bg}{fg} {symbol} {COLOR_RESET}')
+
+        lines.append(''.join(line_parts))
+
+    # Bottom coordinate label
+    lines.append('  ' + ' '.join(f'{COLOR_COORD_LABEL}{chr(ord("a") + col)}{COLOR_RESET}' for col in range(8)))
+
     return '\n'.join(lines)
 
 
-def render_move(move: chess.Move, board: chess.Board) -> str:
-    """Render a move in algebraic notation with piece symbols.
-
-    Args:
-        move: The move to render.
-        board: The board state before the move (for disambiguation).
-
-    Returns:
-        A string like '♘c3' or '♙e4'.
-    """
-    piece = board.piece_at(move.from_square)
-    if piece:
-        symbol = get_piece_symbol(piece)
-        # Use UCI-like notation for simplicity
-        uci = move.uci()
-        return f'{symbol}{uci}'
+def render_move(move: chess.Move, board: chess.Board, san: bool = True) -> str:
+    """Render a chess move in SAN notation or UCI."""
+    if san:
+        try:
+            return board.san(move)
+        except ValueError:
+            return move.uci()
     return move.uci()
 
 
-def render_game_info(game_info: dict) -> str:
-    """Render game metadata like players, date, result, etc."""
+def print_board(
+    board: chess.Board,
+    last_move: chess.Move | None = None,
+    legal_moves: set[chess.Square] | None = None,
+    highlight_squares: set[chess.Square] | None = None,
+) -> None:
+    """Print a colored board to the terminal."""
+    print(render_board(board, last_move, legal_moves, highlight_squares))
+
+
+def print_game_status(board: chess.Board) -> None:
+    """Print the current game status (check, checkmate, stalemate, etc.)."""
+    if board.is_checkmate():
+        winner = 'White' if board.turn == chess.BLACK else 'Black'
+        print(f'Checkmate! {winner} wins.')
+    elif board.is_stalemate():
+        print('Stalemate! The game is a draw.')
+    elif board.is_insufficient_material():
+        print('Draw due to insufficient material.')
+    elif board.is_check():
+        print('Check!')
+    else:
+        print(f"Turn: {'White' if board.turn == chess.WHITE else 'Black'}")
+
+
+def render_move_history(moves: list[chess.Move], board: chess.Board) -> str:
+    """Render the move history in algebraic notation.
+
+    Args:
+        moves: List of moves played.
+        board: The board to use for SAN generation.
+
+    Returns:
+        A string with move numbers and SAN notation.
+    """
     lines: list[str] = []
-    for key, value in game_info.items():
-        lines.append(f'{key}: {value}')
+    temp_board = board.copy()
+    temp_board.clear()
+    # We need to replay moves on a fresh board to get correct SAN
+    # Actually, we'll just use the provided board which is assumed to be at the start
+    # Better: replay from initial position
+    replay_board = chess.Board()
+    move_number = 1
+    line = ''
+    for i, move in enumerate(moves):
+        try:
+            san = replay_board.san(move)
+        except ValueError:
+            san = move.uci()
+        replay_board.push(move)
+        if i % 2 == 0:
+            line = f'{move_number}. {san}'
+            if i == len(moves) - 1:
+                lines.append(line)
+        else:
+            line += f' {san}'
+            lines.append(line)
+            move_number += 1
+            line = ''
+    if line:
+        lines.append(line)
     return '\n'.join(lines)
-
-
-def render_promotion_choices() -> str:
-    """Render a prompt for promotion piece selection."""
-    return 'Promote to: [Q]ueen, [R]ook, [B]ishop, [K]night: '
