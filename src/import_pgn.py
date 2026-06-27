@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import chess
 import chess.pgn
@@ -12,122 +12,113 @@ from .models import EXTENSION_PIECE_MAP, DEFAULT_PIECE, get_piece_for_path, path
 
 def parse_pgn(pgn_string: str) -> Optional[Game]:
     """
-    Parse a PGN string into a Game object.
-    Returns None if parsing fails.
+    Parse a PGN string and return a Game object.
+    Returns None if the PGN is invalid.
     """
     try:
         game = chess.pgn.read_game(pgn_string)
-        if game is None:
-            return None
-        return _pgn_to_game(game)
     except Exception:
         return None
-
-
-def parse_pgn_file(filepath: str) -> Optional[Game]:
-    """
-    Parse a PGN file into a Game object.
-    Returns None if parsing fails.
-    """
-    try:
-        with open(filepath, 'r') as f:
-            pgn_string = f.read()
-        return parse_pgn(pgn_string)
-    except Exception:
+    if game is None:
         return None
+    return _pgn_game_to_git_blame_chess(game)
 
 
-def _pgn_to_game(pgn_game: chess.pgn.GameNode) -> Game:
+def _pgn_game_to_git_blame_chess(pgn_game: chess.pgn.Game) -> Optional[Game]:
     """
-    Convert a chess.pgn.Game object into a Game instance.
-    This uses the PGN headers and moves to reconstruct the commit history.
+    Convert a chess.pgn.Game to a git-blame-chess Game.
     """
-    from datetime import datetime, timezone
-    
     headers = pgn_game.headers
-    
-    # Extract metadata from PGN headers
-    event = headers.get("Event", "Imported PGN Game")
+    # Extract metadata
+    event = headers.get("Event", "")
     site = headers.get("Site", "")
-    date_str = headers.get("Date", "")
-    round_str = headers.get("Round", "")
-    white = headers.get("White", "White")
-    black = headers.get("Black", "Black")
+    date = headers.get("Date", "")
+    round_ = headers.get("Round", "")
+    white = headers.get("White", "")
+    black = headers.get("Black", "")
     result = headers.get("Result", "*")
-    
-    # Parse date if available
-    commit_date = None
-    if date_str:
-        try:
-            import datetime
-            parsed_date = datetime.datetime.strptime(date_str, "%Y.%m.%d")
-            commit_date = parsed_date.replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-    
-    if commit_date is None:
-        commit_date = datetime.now(timezone.utc)
-    
-    # Build commit moves from the game moves
+    # Build repo path from site (if it looks like a path)
+    repo_path = site if site and not site.startswith("http") else "."
+    # Build branch from event (if present)
+    branch = event if event else None
+    # Parse moves
     board = chess.Board()
-    commit_moves: List[CommitMove] = []
-    
-    for move_node in pgn_game.mainline():
-        move = move_node.move
+    moves: List[CommitMove] = []
+    node = pgn_game
+    move_index = 0
+    while node.variations:
+        node = node.variations[0]
+        move = node.move
         if move is None:
             continue
-        
-        # Create a deterministic commit hash based on move
-        import hashlib
-        commit_hash = hashlib.sha256(str(move).encode()).hexdigest()[:8]
-        
-        # Create a commit message from the move
-        commit_message = f"Chess move: {board.san(move)}"
-        
-        # Determine piece type from move
+        # Create a CommitMove from the chess move
+        # We need to map the move to a file change
+        # Use a deterministic mapping: piece type to extension, square to path
         piece = board.piece_at(move.from_square)
-        piece_type = piece.piece_type if piece else chess.PAWN
-        
-        # Map piece type to extension (reverse of get_piece_for_path)
-        ext_to_piece = {v: k for k, v in EXTENSION_PIECE_MAP.items()}
-        file_ext = ext_to_piece.get(piece_type, ".txt")
-        
-        # Create a pseudo file path
-        from_sq_name = chess.SQUARE_NAMES[move.from_square]
-        to_sq_name = chess.SQUARE_NAMES[move.to_square]
-        file_path = f"src/{from_sq_name}_{to_sq_name}{file_ext}"
-        
-        # Compute line number from square index
-        line_number = move.from_square + 1
-        
+        if piece is None:
+            continue
+        piece_type = piece.piece_type
+        # Determine extension based on piece type
+        ext = _piece_type_to_extension(piece_type)
+        # Determine path from square
+        from_file = chess.square_file(move.from_square)
+        from_rank = chess.square_rank(move.from_square)
+        to_file = chess.square_file(move.to_square)
+        to_rank = chess.square_rank(move.to_square)
+        # Construct a pseudo-path
+        from_path = f"src/{chr(ord('a') + from_file)}{from_rank + 1}.{ext}"
+        to_path = f"src/{chr(ord('a') + to_file)}{to_rank + 1}.{ext}"
+        # Determine if it's a capture
+        is_capture = board.is_capture(move)
+        # Promote?
+        promotion = move.promotion
+        # Build commit message from move SAN
+        san = board.san(move)
+        commit_message = f"{san}: {node.comment if node.comment else 'move'}"
+        # Create CommitMove
         commit_move = CommitMove(
-            commit_hash=commit_hash,
-            author=white if len(commit_moves) % 2 == 0 else black,
-            commit_date=commit_date,
-            commit_message=commit_message,
-            file_path=file_path,
-            lines_changed=1,
+            commit_hash=f"pgn:{move_index}",
+            author=white if board.turn == chess.WHITE else black,
+            message=commit_message,
+            timestamp=date,
+            parent_hashes=[],
+            changed_files=[from_path, to_path],
+            lines_added=1,
+            lines_deleted=1 if is_capture else 0,
+            chess_move=move,
             piece_type=piece_type,
             from_square=move.from_square,
             to_square=move.to_square,
-            board_fen=board.fen(),
+            is_capture=is_capture,
+            promotion=promotion,
         )
-        commit_moves.append(commit_move)
-        
-        # Apply the move to the board for next iteration
+        moves.append(commit_move)
         board.push(move)
-    
-    # Create Game object with the constructed moves
+        move_index += 1
+    if not moves:
+        return None
+    # Create Game object
     game = Game(
-        repo_path="",
-        branch="imported",
-        commit_moves=commit_moves,
-        current_index=-1,
-        board=chess.Board(),
-        total_moves=len(commit_moves),
+        repo_path=repo_path,
+        branch=branch or "unknown",
+        board=board,
+        moves=moves,
+        current_index=len(moves) - 1 if result != "*" else 0,
     )
-    
     return game
+
+
+def _piece_type_to_extension(piece_type: int) -> str:
+    """Map chess piece type to file extension."""
+    mapping = {
+        chess.PAWN: "py",
+        chess.KNIGHT: "js",
+        chess.BISHOP: "rs",
+        chess.ROOK: "go",
+        chess.QUEEN: "java",
+        chess.KING: "c",
+    }
+    return mapping.get(piece_type, "txt")
 
 
 def validate_pgn(pgn_string: str) -> Tuple[bool, Optional[str]]:
@@ -137,44 +128,14 @@ def validate_pgn(pgn_string: str) -> Tuple[bool, Optional[str]]:
     """
     try:
         game = chess.pgn.read_game(pgn_string)
-        if game is None:
-            return False, "Failed to parse PGN: empty or invalid format"
-        
-        # Validate that the game has at least one move
-        has_moves = False
-        for _ in game.mainline():
-            has_moves = True
-            break
-        
-        if not has_moves:
-            return False, "PGN game has no moves"
-        
-        # Validate that the game is legal
-        board = chess.Board()
-        for move_node in game.mainline():
-            move = move_node.move
-            if move is None:
-                continue
-            if move not in board.legal_moves:
-                san = board.san(move)
-                return False, f"Illegal move {san} at board position"
-            board.push(move)
-        
-        return True, None
     except Exception as e:
-        return False, f"Error validating PGN: {str(e)}"
-
-
-def validate_pgn_file(filepath: str) -> Tuple[bool, Optional[str]]:
-    """
-    Validate a PGN file.
-    Returns (is_valid, error_message).
-    """
-    try:
-        with open(filepath, 'r') as f:
-            pgn_string = f.read()
-        return validate_pgn(pgn_string)
-    except FileNotFoundError:
-        return False, f"File not found: {filepath}"
-    except Exception as e:
-        return False, f"Error reading file: {str(e)}
+        return False, str(e)
+    if game is None:
+        return False, "Failed to parse PGN: no game found"
+    board = chess.Board()
+    for node in game.mainline():
+        move = node.move
+        if move is None:
+            continue
+        if move not in board.legal_moves:
+            return False, f"Illegal move: {board.san(move)}
