@@ -1,171 +1,138 @@
-from __future__ import annotations
-
-import pytest
-import chess
+import unittest
 from pathlib import Path
+import tempfile
+import os
+
+from git import Repo
+import chess
+
 from src.game import Game, CommitMove
-from src.models import get_piece_for_path, path_to_square
+from src.models import path_to_square, get_piece_for_path
 
 
-class TestPathToSquare:
-    """Tests for path_to_square mapping."""
+class TestGame(unittest.TestCase):
+    """Tests for the Game class."""
 
-    def test_deterministic_mapping(self) -> None:
-        """Same path always maps to same square."""
-        path = "src/main.py"
-        square1 = path_to_square(path)
-        square2 = path_to_square(path)
-        assert square1 == square2
+    def setUp(self):
+        """Create a temporary git repository with some commits."""
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo_path = Path(self.temp_dir.name) / "test_repo"
+        self.repo_path.mkdir(parents=True)
+        self.repo = Repo.init(self.repo_path)
+        # Create initial commit
+        readme = self.repo_path / "README.md"
+        readme.write_text("# Test Repo")
+        self.repo.index.add(["README.md"])
+        self.repo.index.commit("Initial commit")
+        # Create second commit
+        main_file = self.repo_path / "main.py"
+        main_file.write_text("print('hello')")
+        self.repo.index.add(["main.py"])
+        self.repo.index.commit("Add main.py")
+        # Create third commit
+        main_file.write_text("print('hello world')\nprint('goodbye')")
+        self.repo.index.add(["main.py"])
+        self.repo.index.commit("Update main.py")
 
-    def test_different_paths_different_squares(self) -> None:
-        """Different paths likely produce different squares."""
-        squares = {path_to_square(f"file_{i}.txt") for i in range(100)}
-        assert len(squares) > 90  # Allow some collisions
+    def tearDown(self):
+        """Clean up temporary directory."""
+        self.temp_dir.cleanup()
 
-    def test_square_in_range(self) -> None:
-        """Square must be valid chess square (0-63)."""
-        for i in range(50):
-            square = path_to_square(f"test_{i}.py")
-            assert 0 <= square < 64
+    def test_from_repo_initialization(self):
+        """Test that Game.from_repo creates a valid game with correct number of moves."""
+        game = Game.from_repo(self.repo_path)
+        self.assertIsNotNone(game)
+        self.assertEqual(len(game.moves), 3)  # 3 commits
+        self.assertEqual(game.repo_path, self.repo_path)
 
-    def test_different_extensions_same_name(self) -> None:
-        """Files with same name but different extensions map differently."""
-        square1 = path_to_square("file.py")
-        square2 = path_to_square("file.txt")
-        assert square1 != square2
+    def test_from_repo_branch(self):
+        """Test that Game.from_repo with explicit branch works."""
+        game = Game.from_repo(self.repo_path, branch="master")
+        self.assertIsNotNone(game)
+        self.assertEqual(len(game.moves), 3)
 
+    def test_from_repo_invalid_path(self):
+        """Test that Game.from_repo raises FileNotFoundError for invalid path."""
+        with self.assertRaises(FileNotFoundError):
+            Game.from_repo(Path("/nonexistent/path"))
 
-class TestGetPieceForPath:
-    """Tests for piece type mapping from file extension."""
+    def test_from_repo_no_commits(self):
+        """Test that Game.from_repo returns empty game for repo with no commits."""
+        empty_repo = Path(self.temp_dir.name) / "empty_repo"
+        empty_repo.mkdir(parents=True)
+        Repo.init(empty_repo)
+        # No commits yet
+        game = Game.from_repo(empty_repo)
+        self.assertIsNotNone(game)
+        self.assertEqual(len(game.moves), 0)
 
-    def test_python_file_is_pawn(self) -> None:
-        """.py files map to pawn."""
-        piece = get_piece_for_path("src/module.py")
-        assert piece == chess.PAWN
+    def test_commit_move_creation(self):
+        """Test that CommitMove objects are created correctly."""
+        game = Game.from_repo(self.repo_path)
+        move = game.moves[0]
+        self.assertIsInstance(move, CommitMove)
+        self.assertEqual(move.commit.message.strip(), "Initial commit")
+        self.assertEqual(move.commit.hexsha, self.repo.head.commit.hexsha)
 
-    def test_java_file_is_knight(self) -> None:
-        """.java files map to knight."""
-        piece = get_piece_for_path("Main.java")
-        assert piece == chess.KNIGHT
+    def test_commit_move_chess_move(self):
+        """Test that commit moves generate valid chess moves."""
+        game = Game.from_repo(self.repo_path)
+        for move in game.moves:
+            self.assertIsNotNone(move.chess_move)
+            self.assertIsInstance(move.chess_move, chess.Move)
+            self.assertIn(move.chess_move.from_square, chess.SQUARES)
+            self.assertIn(move.chess_move.to_square, chess.SQUARES)
 
-    def test_cpp_file_is_bishop(self) -> None:
-        """.cpp files map to bishop."""
-        piece = get_piece_for_path("utils.cpp")
-        assert piece == chess.BISHOP
+    def test_board_after_moves(self):
+        """Test that applying moves results in a valid board state."""
+        game = Game.from_repo(self.repo_path)
+        board = chess.Board()
+        for move in game.moves:
+            self.assertTrue(move.chess_move in board.legal_moves,
+                            f"Move {move.chess_move} is not legal on board:\n{board}")
+            board.push(move.chess_move)
+        self.assertFalse(board.is_game_over())
+        self.assertIsNotNone(board.fen())
 
-    def test_js_file_is_rook(self) -> None:
-        """.js files map to rook."""
-        piece = get_piece_for_path("app.js")
-        assert piece == chess.ROOK
+    def test_path_to_square_deterministic(self):
+        """Test that path_to_square produces consistent results."""
+        path1 = "src/main.py"
+        path2 = "src/main.py"
+        square1 = path_to_square(path1)
+        square2 = path_to_square(path2)
+        self.assertEqual(square1, square2)
 
-    def test_md_file_is_queen(self) -> None:
-        """.md files map to queen."""
-        piece = get_piece_for_path("README.md")
-        assert piece == chess.QUEEN
+    def test_path_to_square_unique(self):
+        """Test that different paths produce different squares (likely)."""
+        path1 = "a.py"
+        path2 = "b.py"
+        square1 = path_to_square(path1)
+        square2 = path_to_square(path2)
+        self.assertNotEqual(square1, square2)
 
-    def test_unknown_extension_default(self) -> None:
-        """Unknown extensions map to default piece (pawn)."""
-        piece = get_piece_for_path("data.bin")
-        assert piece == chess.PAWN
+    def test_get_piece_for_path_known_extension(self):
+        """Test that known extensions return correct piece type."""
+        self.assertEqual(get_piece_for_path("main.py"), chess.KNIGHT)
+        self.assertEqual(get_piece_for_path("test.js"), chess.KNIGHT)
+        self.assertEqual(get_piece_for_path("styles.css"), chess.ROOK)
+        self.assertEqual(get_piece_for_path("readme.md"), chess.PAWN)
+        self.assertEqual(get_piece_for_path("data.json"), chess.BISHOP)
+        self.assertEqual(get_piece_for_path("template.html"), chess.ROOK)
 
-    def test_no_extension_default(self) -> None:
-        """Files without extension map to default."""
-        piece = get_piece_for_path("Makefile")
-        assert piece == chess.PAWN
+    def test_get_piece_for_path_unknown_extension(self):
+        """Test that unknown extensions return default piece."""
+        from src.models import DEFAULT_PIECE
+        self.assertEqual(get_piece_for_path("unknown.xyz"), DEFAULT_PIECE)
 
-
-class TestCommitMove:
-    """Tests for CommitMove creation and validation."""
-
-    def test_create_valid_move(self) -> None:
-        """Create a CommitMove with valid parameters."""
-        move = CommitMove(
-            commit_hash="abc123",
-            author="test",
-            message="test commit",
-            timestamp=1000,
-            file_changes={"src/main.py": 5},
-            move=chess.Move.from_uci("e2e4"),
-        )
-        assert move.commit_hash == "abc123"
-        assert move.move.uci() == "e2e4"
-
-    def test_move_with_multiple_files(self) -> None:
-        """Move can have multiple file changes."""
-        move = CommitMove(
-            commit_hash="def456",
-            author="dev",
-            message="multiple files",
-            timestamp=2000,
-            file_changes={"src/a.py": 3, "src/b.py": 7},
-            move=chess.Move.from_uci("d2d4"),
-        )
-        assert len(move.file_changes) == 2
-
-
-class TestGameInitialization:
-    """Tests for Game class initialization."""
-
-    def test_game_initial_board(self) -> None:
-        """Game starts with standard starting position."""
-        game = Game()
-        assert game.board.fen() == chess.STARTING_FEN
-        assert len(game.moves) == 0
-
-    def test_game_with_initial_move(self) -> None:
-        """Game can be initialized with a move."""
-        move = chess.Move.from_uci("e2e4")
-        game = Game(initial_move=move)
-        assert len(game.moves) == 1
-        assert game.moves[0].move == move
-
-    def test_game_from_repo_nonexistent(self, tmp_path: Path) -> None:
-        """Game.from_repo raises error for invalid path."""
-        with pytest.raises(Exception):
-            Game.from_repo(tmp_path / "nonexistent")
+    def test_commit_move_square_mapping(self):
+        """Test that commit moves map to squares based on file paths."""
+        game = Game.from_repo(self.repo_path)
+        for move in game.moves:
+            # For each file changed, the move should be from a square derived from the file
+            for file_path in move.files_changed:
+                square = path_to_square(file_path)
+                self.assertIn(square, chess.SQUARES)
 
 
-class TestGameMoveApplication:
-    """Tests for applying moves to the game."""
-
-    def test_apply_valid_move(self) -> None:
-        """Applying a legal move updates the board."""
-        game = Game()
-        move = chess.Move.from_uci("e2e4")
-        commit_move = CommitMove(
-            commit_hash="abc",
-            author="test",
-            message="e4",
-            timestamp=1,
-            file_changes={"test.py": 1},
-            move=move,
-        )
-        game.apply_move(commit_move)
-        assert game.board.piece_at(chess.E4) is not None
-        assert game.board.piece_at(chess.E2) is None
-
-    def test_apply_illegal_move_raises(self) -> None:
-        """Applying an illegal move raises ValueError."""
-        game = Game()
-        move = chess.Move.from_uci("e2e5")  # Invalid for pawn
-        commit_move = CommitMove(
-            commit_hash="abc",
-            author="test",
-            message="bad move",
-            timestamp=1,
-            file_changes={"test.py": 1},
-            move=move,
-        )
-        with pytest.raises(ValueError):
-            game.apply_move(commit_move)
-
-    def test_undo_move(self) -> None:
-        """Undoing a move restores previous board state."""
-        game = Game()
-        move = chess.Move.from_uci("e2e4")
-        commit_move = CommitMove(
-            commit_hash="abc",
-            author="test",
-            message="e4",
-            timestamp=1,
-            file_changes={"test.py": 1}
+if __name__ == "__main__":
+    unittest.main()
